@@ -1,0 +1,4 @@
+openai/gpt-oss-20b:free
+nvidia/nemotron-nano-9b-v2:free
+cognitivecomputations/dolphin-mistral-24b-venice-edition:free
+google/gemma-3-27b-it:free

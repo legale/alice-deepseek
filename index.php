@@ -8,10 +8,6 @@ use GuzzleHttp\Exception\RequestException;
 
 class AliceHandler
 {
-    // не удалять!!!
-    //private const MODEL_ID = 'z-ai/glm-4.5-air:free';
-    private const MODEL_ID = 'openai/gpt-oss-20b:free';
-    
     private const SYSTEM_PROMPT = 'Ты голосовой ассистент, отвечай коротко по существу, без эмодзи и лишних приветствий. Длинный ответы дели на части. Отправляй продолжение, когда просят: дальше или продолжи';
 
     private const QUICK_RESPONSE_TIMEOUT = 4.3; // keep initial round-trip under Alice 4.5s SLA
@@ -21,9 +17,18 @@ class AliceHandler
     private const TECH_ERROR_MESSAGE = 'Произошла техническая ошибка. Пожалуйста, попробуйте позже.';
 
     private Client $client;
+    private string $model_id;
     private string $apiKey;
     private string $pendingDir;
     private string $conversationDir;
+    private array $modelList = [];
+    private int $modelIndex = 0;
+    private string $modelStatePath;
+
+    private const MODEL_SWITCH_TRIGGERS = [
+        'переключи модель',
+        'смени модель'
+    ];
 
     public function __construct()
     {
@@ -34,6 +39,10 @@ class AliceHandler
         $dotenv = Dotenv::createImmutable(__DIR__);
         $dotenv->load();
 
+        $this->model_id = $_ENV['MODEL_ID'];
+        if ($this->model_id === '') {
+            throw new \RuntimeException('model id is not configured.');
+        }
         $this->apiKey = $_ENV['OPENROUTER_API_KEY'] ?? ($_ENV['GEMINI_API_KEY'] ?? '');
         if ($this->apiKey === '') {
             throw new \RuntimeException('API key is not configured.');
@@ -92,6 +101,10 @@ class AliceHandler
         if (!is_dir($this->conversationDir)) {
             mkdir($this->conversationDir, 0777, true);
         }
+
+        $this->modelStatePath = __DIR__ . '/storage/model_state.json';
+        $this->modelList = $this->loadModelList(__DIR__ . '/models.txt');
+        $this->syncModelState();
     }
 
     public function handleRequest(): void
@@ -143,6 +156,12 @@ class AliceHandler
             $history[] = $this->createUserMessage($userMessage);
             $this->saveConversation($sessionId, $history);
 
+            if ($this->processModelSwitchCommand($userMessage, $history, $sessionId, $responseTemplate)) {
+                $this->sendResponse($responseTemplate);
+                $this->releaseSession();
+                return;
+            }
+
             try {
                 $aiPayload = $this->requestAiResponse($history, self::QUICK_RESPONSE_TIMEOUT);
                 $responseTemplate['response']['text'] = $this->truncateResponse($aiPayload['text']);
@@ -192,9 +211,127 @@ class AliceHandler
             }
         }
 
-        $responseTemplate['response']['text'] = 'Godeep на связи.';
+        $responseTemplate['response']['text'] = $this->buildGreetingMessage();
         $this->sendResponse($responseTemplate);
         $this->releaseSession();
+    }
+
+    private function processModelSwitchCommand(string $userMessage, array &$history, string $sessionId, array &$responseTemplate): bool
+    {
+        if (!$this->containsModelSwitchCommand($userMessage)) {
+            return false;
+        }
+
+        $newModel = $this->switchToNextModel();
+        $switchText = 'переключаю на: ' . $newModel . ' модели.';
+        $history[] = $this->createAssistantMessageFromText($switchText);
+        $this->saveConversation($sessionId, $history);
+        $responseTemplate['response']['text'] = $switchText;
+
+        return true;
+    }
+
+    private function containsModelSwitchCommand(string $text): bool
+    {
+        $haystack = mb_strtolower($text);
+        foreach (self::MODEL_SWITCH_TRIGGERS as $trigger) {
+            if (mb_strpos($haystack, $trigger) !== false) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function switchToNextModel(): string
+    {
+        if (empty($this->modelList)) {
+            return $this->model_id;
+        }
+
+        $total = count($this->modelList);
+        $this->modelIndex = ($this->modelIndex + 1) % $total;
+        $this->model_id = $this->modelList[$this->modelIndex];
+        $this->persistModelState($this->model_id);
+
+        return $this->model_id;
+    }
+
+    private function buildGreetingMessage(): string
+    {
+        return sprintf('%s на связи!', $this->model_id);
+    }
+
+    private function loadModelList(string $path): array
+    {
+        if (!is_file($path)) {
+            return [];
+        }
+
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
+            return [];
+        }
+
+        $models = [];
+        foreach ($lines as $line) {
+            $name = trim($line);
+            if ($name !== '') {
+                $models[] = $name;
+            }
+        }
+
+        return $models;
+    }
+
+    private function syncModelState(): void
+    {
+        if (empty($this->modelList)) {
+            $this->modelIndex = 0;
+            return;
+        }
+
+        $storedModel = $this->loadModelState();
+        if ($storedModel !== null && in_array($storedModel, $this->modelList, true)) {
+            $this->model_id = $storedModel;
+        } elseif (!in_array($this->model_id, $this->modelList, true)) {
+            $this->model_id = $this->modelList[0];
+        }
+
+        $index = array_search($this->model_id, $this->modelList, true);
+        $this->modelIndex = ($index === false) ? 0 : $index;
+        $this->model_id = $this->modelList[$this->modelIndex];
+        $this->persistModelState($this->model_id);
+    }
+
+    private function loadModelState(): ?string
+    {
+        if ($this->modelStatePath === '' || !is_file($this->modelStatePath)) {
+            return null;
+        }
+
+        $contents = file_get_contents($this->modelStatePath);
+        if ($contents === false || trim($contents) === '') {
+            return null;
+        }
+
+        $data = json_decode($contents, true);
+        if (is_array($data) && isset($data['current_model']) && is_string($data['current_model'])) {
+            return $data['current_model'];
+        }
+
+        $fallback = trim($contents);
+        return $fallback !== '' ? $fallback : null;
+    }
+
+    private function persistModelState(string $model): void
+    {
+        if ($this->modelStatePath === '') {
+            return;
+        }
+
+        $payload = json_encode(['current_model' => $model], JSON_UNESCAPED_UNICODE);
+        file_put_contents($this->modelStatePath, $payload, LOCK_EX);
     }
 
     private function requestAiResponse(array $history, float $timeoutSeconds): array
@@ -203,7 +340,7 @@ class AliceHandler
         $timeout = max(1.0, $timeoutSeconds);
 
         $payload = [
-            'model' => self::MODEL_ID,
+            'model' => $this->model_id,
             'messages' => $messages,
         ];
         $this->logAiRequest($payload);
@@ -313,7 +450,7 @@ class AliceHandler
 
         if ($status === 'ready' && array_key_exists('response', $pendingState)) {
             $responsePayload = $pendingState['response'];
-            $conversationUpdated = (bool)($pendingState['conversation_updated'] ?? false);
+            $conversationUpdated = (bool) ($pendingState['conversation_updated'] ?? false);
 
             if (is_array($responsePayload)) {
                 $text = $responsePayload['text'] ?? self::TECH_ERROR_MESSAGE;
@@ -323,7 +460,7 @@ class AliceHandler
                     $this->appendAssistantMessage($sessionId, $responsePayload['message']);
                 }
             } else {
-                $text = (string)$responsePayload;
+                $text = (string) $responsePayload;
                 $responseTemplate['response']['text'] = $this->truncateResponse($text);
 
                 if (!$conversationUpdated) {
@@ -440,10 +577,12 @@ class AliceHandler
     private function normalizeContentParts($content): array
     {
         if (is_string($content)) {
-            return [[
-                'type' => 'text',
-                'text' => $content
-            ]];
+            return [
+                [
+                    'type' => 'text',
+                    'text' => $content
+                ]
+            ];
         }
 
         $parts = [];
