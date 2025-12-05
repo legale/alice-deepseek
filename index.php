@@ -39,10 +39,7 @@ class AliceHandler
         $dotenv = Dotenv::createImmutable(__DIR__);
         $dotenv->load();
 
-        $this->model_id = $_ENV['MODEL_ID'];
-        if ($this->model_id === '') {
-            throw new \RuntimeException('model id is not configured.');
-        }
+        $this->model_id = $_ENV['MODEL_ID'] ?? '';
         $this->apiKey = $_ENV['OPENROUTER_API_KEY'] ?? ($_ENV['GEMINI_API_KEY'] ?? '');
         if ($this->apiKey === '') {
             throw new \RuntimeException('API key is not configured.');
@@ -105,6 +102,10 @@ class AliceHandler
         $this->modelStatePath = __DIR__ . '/storage/model_state.json';
         $this->modelList = $this->loadModelList(__DIR__ . '/models.txt');
         $this->syncModelState();
+
+        if ($this->model_id === '') {
+            throw new \RuntimeException('model id is not configured. Add MODEL_ID to .env or fill models.txt');
+        }
     }
 
     public function handleRequest(): void
