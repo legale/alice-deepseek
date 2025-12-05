@@ -29,6 +29,14 @@ class AliceHandler
         'переключи модель',
         'смени модель'
     ];
+    private const HELP_COMMANDS = [
+        'помощь',
+        'что ты умеешь',
+        'что ты умеешь?'
+    ];
+    private const HELP_MESSAGE = 'Я голосовой помощник по типу chatGPT. Я отвечаю на любые вопросы, 
+    со мной можно вести длинный разговор на любую тему! Держу большой контекст (132к), а если GPT-OSS надоест, могу переключатся
+     между моделями, не теряя нить разговора. Спроси что угодно или скажи «переключи модель», чтобы выбрать другую модель.';
 
     public function __construct()
     {
@@ -157,6 +165,12 @@ class AliceHandler
             $history[] = $this->createUserMessage($userMessage);
             $this->saveConversation($sessionId, $history);
 
+            if ($this->processHelpCommand($userMessage, $history, $sessionId, $responseTemplate)) {
+                $this->sendResponse($responseTemplate);
+                $this->releaseSession();
+                return;
+            }
+
             if ($this->processModelSwitchCommand($userMessage, $history, $sessionId, $responseTemplate)) {
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
@@ -217,19 +231,37 @@ class AliceHandler
         $this->releaseSession();
     }
 
+    private function processHelpCommand(string $userMessage, array &$history, string $sessionId, array &$responseTemplate): bool
+    {
+        if (!$this->isHelpCommand($userMessage)) {
+            return false;
+        }
+
+        $history[] = $this->createAssistantMessageFromText(self::HELP_MESSAGE);
+        $this->saveConversation($sessionId, $history);
+        $responseTemplate['response']['text'] = self::HELP_MESSAGE;
+        return true;
+    }
+
     private function processModelSwitchCommand(string $userMessage, array &$history, string $sessionId, array &$responseTemplate): bool
     {
         if (!$this->containsModelSwitchCommand($userMessage)) {
             return false;
         }
 
-        $newModel = $this->switchToNextModel();
-        $switchText = 'переключаю на: ' . $newModel . ' модели.';
+        $newModelId = $this->switchToNextModel();
+        $switchText = 'переключаю на: ' . $this->displayModelName($newModelId) . ' модели.';
         $history[] = $this->createAssistantMessageFromText($switchText);
         $this->saveConversation($sessionId, $history);
         $responseTemplate['response']['text'] = $switchText;
 
         return true;
+    }
+
+    private function isHelpCommand(string $text): bool
+    {
+        $normalized = $this->normalizeCommand($text);
+        return in_array($normalized, self::HELP_COMMANDS, true);
     }
 
     private function containsModelSwitchCommand(string $text): bool
@@ -260,7 +292,21 @@ class AliceHandler
 
     private function buildGreetingMessage(): string
     {
-        return sprintf('%s на связи!', $this->model_id);
+        $displayName = $this->displayModelName($this->model_id);
+        return sprintf('%s на связи! Спроси что угодно или скажи «помощь», чтобы услышать инструкцию.', $displayName);
+    }
+
+    private function displayModelName(string $modelId): string
+    {
+        $clean = preg_replace('/:free$/i', '', $modelId);
+        return $clean !== '' ? $clean : $modelId;
+    }
+
+    private function normalizeCommand(string $text): string
+    {
+        $normalized = mb_strtolower(trim($text));
+        $normalized = rtrim($normalized, "?!.," . "\t\n\r\0\x0B");
+        return trim($normalized);
     }
 
     private function loadModelList(string $path): array
@@ -746,52 +792,53 @@ class AliceHandler
     private function loadPendingState(string $sessionId): ?array
     {
         $path = $this->getPendingFilePath($sessionId);
-        if (!is_file($path)) {
+        if ($path === null || !is_file($path)) {
             return null;
         }
 
-        $contents = file_get_contents($path);
-        if ($contents === false) {
-            return null;
-        }
-
-        $data = json_decode($contents, true);
+        $data = $this->readCompressedJson($path);
         return is_array($data) ? $data : null;
     }
 
     private function savePendingState(string $sessionId, array $state): void
     {
-        $path = $this->getPendingFilePath($sessionId);
-        file_put_contents($path, json_encode($state, JSON_UNESCAPED_UNICODE), LOCK_EX);
+        $path = $this->getPendingFilePath($sessionId, true);
+        if ($path === null) {
+            return;
+        }
+
+        $legacyPath = $this->isLegacyJsonPath($path) ? $path : null;
+        if ($legacyPath !== null) {
+            $path = $this->buildTimestampedFilePath($this->pendingDir, $sessionId, $this->getFileTimestamp($legacyPath));
+        }
+
+        $this->writeCompressedJson($path, $state);
+
+        if ($legacyPath !== null && is_file($legacyPath)) {
+            @unlink($legacyPath);
+        }
+
+        $this->enforceStorageLimits($this->pendingDir);
     }
 
     private function clearPendingState(string $sessionId): void
     {
-        $path = $this->getPendingFilePath($sessionId);
-        if (is_file($path)) {
-            unlink($path);
-        }
+        $this->deleteSessionFiles($this->pendingDir, $sessionId);
     }
 
-    private function getPendingFilePath(string $sessionId): string
+    private function getPendingFilePath(string $sessionId, bool $create = false): ?string
     {
-        $safeId = preg_replace('/[^A-Za-z0-9_-]/', '_', $sessionId);
-        return $this->pendingDir . '/' . $safeId . '.json';
+        return $this->getSessionFilePath($this->pendingDir, $sessionId, $create);
     }
 
     private function loadConversation(string $sessionId): array
     {
         $path = $this->getConversationFilePath($sessionId);
-        if (!is_file($path)) {
+        if ($path === null || !is_file($path)) {
             return [];
         }
 
-        $contents = file_get_contents($path);
-        if ($contents === false) {
-            return [];
-        }
-
-        $data = json_decode($contents, true);
+        $data = $this->readCompressedJson($path);
         if (!is_array($data)) {
             return [];
         }
@@ -814,22 +861,159 @@ class AliceHandler
 
     private function saveConversation(string $sessionId, array $history): void
     {
-        $path = $this->getConversationFilePath($sessionId);
-        file_put_contents($path, json_encode(array_values($history), JSON_UNESCAPED_UNICODE), LOCK_EX);
+        $path = $this->getConversationFilePath($sessionId, true);
+        if ($path === null) {
+            return;
+        }
+
+        $legacyPath = $this->isLegacyJsonPath($path) ? $path : null;
+        if ($legacyPath !== null) {
+            $path = $this->buildTimestampedFilePath($this->conversationDir, $sessionId, $this->getFileTimestamp($legacyPath));
+        }
+
+        $this->writeCompressedJson($path, array_values($history));
+
+        if ($legacyPath !== null && is_file($legacyPath)) {
+            @unlink($legacyPath);
+        }
+
+        $this->enforceStorageLimits($this->conversationDir);
     }
 
     private function clearConversation(string $sessionId): void
     {
-        $path = $this->getConversationFilePath($sessionId);
-        if (is_file($path)) {
-            unlink($path);
+        $this->deleteSessionFiles($this->conversationDir, $sessionId);
+    }
+
+    private function getConversationFilePath(string $sessionId, bool $create = false): ?string
+    {
+        return $this->getSessionFilePath($this->conversationDir, $sessionId, $create);
+    }
+
+    private function getSessionFilePath(string $directory, string $sessionId, bool $create): ?string
+    {
+        $safeId = $this->sanitizeSessionId($sessionId);
+        $pattern = sprintf('%s/*_%s.json.gz', $directory, $safeId);
+        $files = glob($pattern) ?: [];
+
+        if (!empty($files)) {
+            usort($files, static function ($a, $b) {
+                $timeA = @filemtime($a) ?: 0;
+                $timeB = @filemtime($b) ?: 0;
+                return $timeB <=> $timeA;
+            });
+
+            return $files[0];
+        }
+
+        $legacyPath = sprintf('%s/%s.json', $directory, $safeId);
+        if (is_file($legacyPath)) {
+            return $legacyPath;
+        }
+
+        return $create ? $this->buildTimestampedFilePath($directory, $sessionId) : null;
+    }
+
+    private function buildTimestampedFilePath(string $directory, string $sessionId, ?int $baseTime = null): string
+    {
+        $safeId = $this->sanitizeSessionId($sessionId);
+        $timestamp = gmdate('Ymd_His', $baseTime ?? time());
+        return sprintf('%s/%s_%s.json.gz', $directory, $timestamp, $safeId);
+    }
+
+    private function deleteSessionFiles(string $directory, string $sessionId): void
+    {
+        $safeId = $this->sanitizeSessionId($sessionId);
+        $patterns = [
+            sprintf('%s/*_%s.json.gz', $directory, $safeId),
+            sprintf('%s/%s.json', $directory, $safeId)
+        ];
+
+        foreach ($patterns as $pattern) {
+            $files = glob($pattern) ?: [];
+            foreach ($files as $file) {
+                @unlink($file);
+            }
         }
     }
 
-    private function getConversationFilePath(string $sessionId): string
+    private function readCompressedJson(string $path)
     {
-        $safeId = preg_replace('/[^A-Za-z0-9_-]/', '_', $sessionId);
-        return $this->conversationDir . '/' . $safeId . '.json';
+        $contents = @file_get_contents($path);
+        if ($contents === false) {
+            return null;
+        }
+
+        $decoded = @gzdecode($contents);
+        $json = $decoded !== false ? $decoded : $contents;
+
+        return json_decode($json, true);
+    }
+
+    private function writeCompressedJson(string $path, array $payload): void
+    {
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            return;
+        }
+
+        $encoded = gzencode($json, 5);
+        $data = $encoded !== false ? $encoded : $json;
+        file_put_contents($path, $data, LOCK_EX);
+    }
+
+    private function enforceStorageLimits(string $directory): void
+    {
+        $files = glob($directory . '/*.json.gz') ?: [];
+        if (count($files) <= 100) {
+            return;
+        }
+
+        $threshold = time() - (4 * 3600);
+        foreach ($files as $file) {
+            $mtime = @filemtime($file);
+            if ($mtime !== false && $mtime < $threshold) {
+                @unlink($file);
+            }
+        }
+    }
+
+    private function sanitizeSessionId(string $sessionId): string
+    {
+        $safeChars = [];
+        $allowed = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_';
+
+        foreach (str_split($sessionId) as $char) {
+            $safeChars[] = (strpos($allowed, $char) !== false) ? $char : '_';
+        }
+
+        $sanitized = implode('', $safeChars);
+        return $sanitized !== '' ? $sanitized : 'session';
+    }
+
+    private function isLegacyJsonPath(string $path): bool
+    {
+        return $this->endsWith($path, '.json');
+    }
+
+    private function getFileTimestamp(string $path): int
+    {
+        $timestamp = @filemtime($path);
+        return $timestamp !== false ? $timestamp : time();
+    }
+
+    private function endsWith(string $haystack, string $needle): bool
+    {
+        if ($needle === '') {
+            return true;
+        }
+
+        $length = strlen($needle);
+        if ($length === 0) {
+            return true;
+        }
+
+        return substr($haystack, -$length) === $needle;
     }
 
     private function isTimeoutException(RequestException $exception): bool
