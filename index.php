@@ -9,7 +9,9 @@ use GuzzleHttp\Exception\RequestException;
 class AliceHandler
 {
     private const MODEL_ID = 'z-ai/glm-4.5-air:free';
-    private const QUICK_RESPONSE_TIMEOUT = 4.2; // keep initial round-trip under Alice 4.5s SLA
+    private const SYSTEM_PROMPT = 'Отвечай по существу вопроса, без эмодзи и лишних приветствий.';
+
+    private const QUICK_RESPONSE_TIMEOUT = 3.0; // keep initial round-trip under Alice 4.5s SLA
     private const MAX_WAIT_SECONDS = 20.0;
     private const WAITING_MESSAGE = 'Думаю. Спросите меня через несколько секунд: Готово? и я отвечу';
     private const SESSION_RESET_MESSAGE = 'Ответ так и не сформировался, давайте попробуем заново.';
@@ -17,8 +19,8 @@ class AliceHandler
 
     private Client $client;
     private string $apiKey;
-    private array $sessionState = [];
     private string $pendingDir;
+    private string $conversationDir;
 
     public function __construct()
     {
@@ -78,14 +80,14 @@ class AliceHandler
 
         $this->client = new Client($clientConfig);
 
-        if (!isset($_SESSION['users_state'])) {
-            $_SESSION['users_state'] = [];
-        }
-        $this->sessionState = &$_SESSION['users_state'];
-
         $this->pendingDir = __DIR__ . '/storage/pending';
         if (!is_dir($this->pendingDir)) {
             mkdir($this->pendingDir, 0777, true);
+        }
+
+        $this->conversationDir = __DIR__ . '/storage/conversations';
+        if (!is_dir($this->conversationDir)) {
+            mkdir($this->conversationDir, 0777, true);
         }
     }
 
@@ -131,15 +133,12 @@ class AliceHandler
             }
         }
 
-        if (!isset($this->sessionState[$sessionId])) {
-            $this->sessionState[$sessionId] = ['messages' => []];
-        }
-
+        $history = $this->loadConversation($sessionId);
         $utterance = $input['request']['original_utterance'] ?? '';
         if ($utterance !== '') {
             $userMessage = $this->cleanInput($utterance);
-            $this->sessionState[$sessionId]['messages'][] = $userMessage;
-            $history = $this->sessionState[$sessionId]['messages'];
+            $history[] = $userMessage;
+            $this->saveConversation($sessionId, $history);
 
             try {
                 $responseText = $this->requestAiResponse($history, self::QUICK_RESPONSE_TIMEOUT);
@@ -299,7 +298,7 @@ class AliceHandler
 
         if ($status === 'expired' || $now >= $deadline) {
             $this->clearPendingState($sessionId);
-            unset($this->sessionState[$sessionId]);
+            $this->clearConversation($sessionId);
             $responseTemplate['response']['text'] = self::SESSION_RESET_MESSAGE;
             return $responseTemplate;
         }
@@ -332,7 +331,13 @@ class AliceHandler
             $history = ['Отвечай на приветствие пользователя.'];
         }
 
-        $messages = [];
+        $messages = [[
+            'role' => 'system',
+            'content' => [[
+                'type' => 'text',
+                'text' => self::SYSTEM_PROMPT
+            ]]
+        ]];
         foreach ($history as $text) {
             $messages[] = [
                 'role' => 'user',
@@ -479,6 +484,42 @@ class AliceHandler
     {
         $safeId = preg_replace('/[^A-Za-z0-9_-]/', '_', $sessionId);
         return $this->pendingDir . '/' . $safeId . '.json';
+    }
+
+    private function loadConversation(string $sessionId): array
+    {
+        $path = $this->getConversationFilePath($sessionId);
+        if (!is_file($path)) {
+            return [];
+        }
+
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            return [];
+        }
+
+        $data = json_decode($contents, true);
+        return is_array($data) ? $data : [];
+    }
+
+    private function saveConversation(string $sessionId, array $history): void
+    {
+        $path = $this->getConversationFilePath($sessionId);
+        file_put_contents($path, json_encode(array_values($history), JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+
+    private function clearConversation(string $sessionId): void
+    {
+        $path = $this->getConversationFilePath($sessionId);
+        if (is_file($path)) {
+            unlink($path);
+        }
+    }
+
+    private function getConversationFilePath(string $sessionId): string
+    {
+        $safeId = preg_replace('/[^A-Za-z0-9_-]/', '_', $sessionId);
+        return $this->conversationDir . '/' . $safeId . '.json';
     }
 
     private function isTimeoutException(RequestException $exception): bool
