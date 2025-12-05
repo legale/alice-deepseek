@@ -8,12 +8,15 @@ use GuzzleHttp\Exception\RequestException;
 
 class AliceHandler
 {
-    private const MODEL_ID = 'z-ai/glm-4.5-air:free';
-    private const SYSTEM_PROMPT = 'Отвечай по существу вопроса, без эмодзи и лишних приветствий.';
+    // не удалять!!!
+    //private const MODEL_ID = 'z-ai/glm-4.5-air:free';
+    private const MODEL_ID = 'openai/gpt-oss-20b:free';
+    
+    private const SYSTEM_PROMPT = 'Ты голосовой ассистент, отвечай коротко по существу, без эмодзи и лишних приветствий. Длинный ответы дели на части. Отправляй продолжение, когда просят: дальше или продолжи';
 
-    private const QUICK_RESPONSE_TIMEOUT = 3.0; // keep initial round-trip under Alice 4.5s SLA
-    private const MAX_WAIT_SECONDS = 20.0;
-    private const WAITING_MESSAGE = 'Думаю. Спросите меня через несколько секунд: Готово? и я отвечу';
+    private const QUICK_RESPONSE_TIMEOUT = 4.3; // keep initial round-trip under Alice 4.5s SLA
+    private const MAX_WAIT_SECONDS = 30.0;
+    private const WAITING_MESSAGE = 'Надо подумать. Через несколько секунд скажите: Готово?';
     private const SESSION_RESET_MESSAGE = 'Ответ так и не сформировался, давайте попробуем заново.';
     private const TECH_ERROR_MESSAGE = 'Произошла техническая ошибка. Пожалуйста, попробуйте позже.';
 
@@ -137,12 +140,14 @@ class AliceHandler
         $utterance = $input['request']['original_utterance'] ?? '';
         if ($utterance !== '') {
             $userMessage = $this->cleanInput($utterance);
-            $history[] = $userMessage;
+            $history[] = $this->createUserMessage($userMessage);
             $this->saveConversation($sessionId, $history);
 
             try {
-                $responseText = $this->requestAiResponse($history, self::QUICK_RESPONSE_TIMEOUT);
-                $responseTemplate['response']['text'] = $this->truncateResponse($responseText);
+                $aiPayload = $this->requestAiResponse($history, self::QUICK_RESPONSE_TIMEOUT);
+                $responseTemplate['response']['text'] = $this->truncateResponse($aiPayload['text']);
+                $history[] = $aiPayload['message'];
+                $this->saveConversation($sessionId, $history);
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
                 return;
@@ -159,7 +164,10 @@ class AliceHandler
 
                 error_log('OpenRouter connection error: ' . $e->getMessage());
                 error_log('OpenRouter connection context: ' . json_encode($e->getHandlerContext()));
-                $responseTemplate['response']['text'] = $this->formatConnectError($e);
+                $errorText = $this->formatConnectError($e);
+                $responseTemplate['response']['text'] = $errorText;
+                $history[] = $this->createAssistantMessageFromText($errorText);
+                $this->saveConversation($sessionId, $history);
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
                 return;
@@ -176,6 +184,8 @@ class AliceHandler
                 error_log('OpenRouter API error: ' . $e->getMessage());
                 $errorText = $this->formatRequestError($e);
                 $responseTemplate['response']['text'] = $errorText;
+                $history[] = $this->createAssistantMessageFromText($errorText);
+                $this->saveConversation($sessionId, $history);
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
                 return;
@@ -187,7 +197,7 @@ class AliceHandler
         $this->releaseSession();
     }
 
-    private function requestAiResponse(array $history, float $timeoutSeconds): string
+    private function requestAiResponse(array $history, float $timeoutSeconds): array
     {
         $messages = $this->buildMessages($history);
         $timeout = max(1.0, $timeoutSeconds);
@@ -205,7 +215,7 @@ class AliceHandler
         ]);
 
         $body = json_decode($response->getBody(), true);
-        return $this->extractResponseText($body);
+        return $this->extractResponsePayload($body);
     }
 
     private function createPendingState(string $sessionId, array $history): array
@@ -232,12 +242,14 @@ class AliceHandler
                 return;
             }
 
-            $responseText = $this->requestAiResponse($history, $remaining);
+            $responsePayload = $this->requestAiResponse($history, $remaining);
+            $this->appendAssistantMessage($sessionId, $responsePayload['message']);
             $this->savePendingState($sessionId, [
                 'status' => 'ready',
                 'started_at' => $startedAt,
                 'history' => $history,
-                'response' => $responseText
+                'response' => $responsePayload,
+                'conversation_updated' => true
             ]);
         } catch (ConnectException $e) {
             $errno = $this->getCurlErrno($e);
@@ -250,11 +262,14 @@ class AliceHandler
             error_log('OpenRouter connection error (background): ' . $e->getMessage());
             error_log('OpenRouter connection context (background): ' . json_encode($e->getHandlerContext()));
             $errorText = $this->formatConnectError($e);
+            $payload = $this->createAssistantPayloadFromText($errorText);
+            $this->appendAssistantMessage($sessionId, $payload['message']);
             $this->savePendingState($sessionId, [
                 'status' => 'ready',
                 'started_at' => $startedAt,
                 'history' => $history,
-                'response' => $errorText
+                'response' => $payload,
+                'conversation_updated' => true
             ]);
         } catch (RequestException $e) {
             if ($this->isTimeoutException($e)) {
@@ -265,20 +280,26 @@ class AliceHandler
 
             error_log('OpenRouter API error (background): ' . $e->getMessage());
             $errorText = $this->formatRequestError($e);
+            $payload = $this->createAssistantPayloadFromText($errorText);
+            $this->appendAssistantMessage($sessionId, $payload['message']);
             $this->savePendingState($sessionId, [
                 'status' => 'ready',
                 'started_at' => $startedAt,
                 'history' => $history,
-                'response' => $errorText
+                'response' => $payload,
+                'conversation_updated' => true
             ]);
         } catch (\Throwable $e) {
             error_log('Background fetch failure: ' . $e->getMessage());
             $errorText = $this->formatGenericError($e);
+            $payload = $this->createAssistantPayloadFromText($errorText);
+            $this->appendAssistantMessage($sessionId, $payload['message']);
             $this->savePendingState($sessionId, [
                 'status' => 'ready',
                 'started_at' => $startedAt,
                 'history' => $history,
-                'response' => $errorText
+                'response' => $payload,
+                'conversation_updated' => true
             ]);
         }
     }
@@ -291,7 +312,25 @@ class AliceHandler
         $now = microtime(true);
 
         if ($status === 'ready' && array_key_exists('response', $pendingState)) {
-            $responseTemplate['response']['text'] = $this->truncateResponse($pendingState['response']);
+            $responsePayload = $pendingState['response'];
+            $conversationUpdated = (bool)($pendingState['conversation_updated'] ?? false);
+
+            if (is_array($responsePayload)) {
+                $text = $responsePayload['text'] ?? self::TECH_ERROR_MESSAGE;
+                $responseTemplate['response']['text'] = $this->truncateResponse($text);
+
+                if (!$conversationUpdated && !empty($responsePayload['message'])) {
+                    $this->appendAssistantMessage($sessionId, $responsePayload['message']);
+                }
+            } else {
+                $text = (string)$responsePayload;
+                $responseTemplate['response']['text'] = $this->truncateResponse($text);
+
+                if (!$conversationUpdated) {
+                    $this->appendAssistantMessage($sessionId, $this->createAssistantMessageFromText($text));
+                }
+            }
+
             $this->clearPendingState($sessionId);
             return $responseTemplate;
         }
@@ -328,44 +367,158 @@ class AliceHandler
     private function buildMessages(array $history): array
     {
         if (empty($history)) {
-            $history = ['Отвечай на приветствие пользователя.'];
+            $history = [$this->createUserMessage('Отвечай на приветствие пользователя.')];
         }
 
-        $messages = [[
-            'role' => 'system',
-            'content' => [[
-                'type' => 'text',
-                'text' => self::SYSTEM_PROMPT
-            ]]
-        ]];
-        foreach ($history as $text) {
-            $messages[] = [
-                'role' => 'user',
+        $messages = [
+            [
+                'role' => 'system',
                 'content' => [
                     [
                         'type' => 'text',
-                        'text' => $text
+                        'text' => self::SYSTEM_PROMPT
                     ]
                 ]
+            ]
+        ];
+
+        foreach ($history as $entry) {
+            if (!is_array($entry) || empty($entry['role'])) {
+                continue;
+            }
+
+            $messages[] = [
+                'role' => $entry['role'],
+                'content' => $this->normalizeContentParts($entry['content'] ?? [])
             ];
         }
 
         return $messages;
     }
 
-    private function extractResponseText(array $response): string
+    private function createUserMessage(string $text): array
     {
-        if (!empty($response['choices'][0]['message']['content'])) {
-            $content = $response['choices'][0]['message']['content'];
-            if (is_array($content)) {
-                $content = implode("\n", array_map('trim', $content));
+        return [
+            'role' => 'user',
+            'content' => [
+                [
+                    'type' => 'text',
+                    'text' => $text
+                ]
+            ]
+        ];
+    }
+
+    private function createAssistantMessageFromText(string $text): array
+    {
+        return [
+            'role' => 'assistant',
+            'content' => [
+                [
+                    'type' => 'text',
+                    'text' => $text
+                ]
+            ]
+        ];
+    }
+
+    private function createAssistantPayloadFromText(string $text): array
+    {
+        return [
+            'text' => $text,
+            'message' => $this->createAssistantMessageFromText($text)
+        ];
+    }
+
+    private function appendAssistantMessage(string $sessionId, array $message): void
+    {
+        $history = $this->loadConversation($sessionId);
+        $history[] = $message;
+        $this->saveConversation($sessionId, $history);
+    }
+
+    private function normalizeContentParts($content): array
+    {
+        if (is_string($content)) {
+            return [[
+                'type' => 'text',
+                'text' => $content
+            ]];
+        }
+
+        $parts = [];
+        foreach ((array) $content as $part) {
+            if (is_string($part)) {
+                $parts[] = [
+                    'type' => 'text',
+                    'text' => $part
+                ];
+                continue;
             }
 
-            return trim((string) $content);
+            if (!is_array($part)) {
+                continue;
+            }
+
+            $type = $part['type'] ?? 'text';
+            if ($type === 'text') {
+                $parts[] = [
+                    'type' => 'text',
+                    'text' => (string) ($part['text'] ?? '')
+                ];
+            } else {
+                $parts[] = $part;
+            }
+        }
+
+        if (empty($parts)) {
+            $parts[] = [
+                'type' => 'text',
+                'text' => self::TECH_ERROR_MESSAGE
+            ];
+        }
+
+        return $parts;
+    }
+
+    private function buildDisplayTextFromParts(array $parts): string
+    {
+        $texts = [];
+        foreach ($parts as $part) {
+            if (($part['type'] ?? 'text') === 'text' && isset($part['text'])) {
+                $value = trim((string) $part['text']);
+                if ($value !== '') {
+                    $texts[] = $value;
+                }
+            }
+        }
+
+        $text = trim(implode("\n", $texts));
+        return $text !== '' ? $text : self::TECH_ERROR_MESSAGE;
+    }
+
+    private function extractResponsePayload(array $response): array
+    {
+        if (!empty($response['choices'][0]['message'])) {
+            $message = $response['choices'][0]['message'];
+            $parts = $this->normalizeContentParts($message['content'] ?? []);
+            if (!empty($parts)) {
+                return [
+                    'text' => $this->buildDisplayTextFromParts($parts),
+                    'message' => [
+                        'role' => $message['role'] ?? 'assistant',
+                        'content' => $parts
+                    ]
+                ];
+            }
         }
 
         error_log('Unexpected OpenRouter response: ' . json_encode($response));
-        return self::TECH_ERROR_MESSAGE;
+        $fallback = $this->createAssistantMessageFromText(self::TECH_ERROR_MESSAGE);
+        return [
+            'text' => self::TECH_ERROR_MESSAGE,
+            'message' => $fallback
+        ];
     }
 
     private function cleanInput(string $input): string
@@ -499,7 +652,24 @@ class AliceHandler
         }
 
         $data = json_decode($contents, true);
-        return is_array($data) ? $data : [];
+        if (!is_array($data)) {
+            return [];
+        }
+
+        $history = [];
+        foreach ($data as $entry) {
+            if (is_array($entry) && isset($entry['role'])) {
+                $normalized = [
+                    'role' => $entry['role'],
+                    'content' => $this->normalizeContentParts($entry['content'] ?? [])
+                ];
+                $history[] = $normalized;
+            } elseif (is_string($entry)) {
+                $history[] = $this->createUserMessage($entry);
+            }
+        }
+
+        return $history;
     }
 
     private function saveConversation(string $sessionId, array $history): void
