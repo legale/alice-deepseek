@@ -367,7 +367,7 @@ class AliceHandler
     private function buildMessages(array $history): array
     {
         if (empty($history)) {
-            $history = [$this->createUserMessage('Отвечай на приветствие пользователя.')];
+            $history = [];
         }
 
         $messages = [
