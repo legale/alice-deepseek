@@ -8,8 +8,13 @@ use GuzzleHttp\Exception\RequestException;
 
 class AliceHandler
 {
-    private const SYSTEM_PROMPT = 'Ты голосовой ассистент, отвечай коротко по существу, без эмодзи и лишних приветствий. Длинный ответы дели на части. Отправляй продолжение, когда просят: дальше или продолжи';
-
+    private const SYSTEM_PROMPT = 'Ты голосовой ассистент, отвечай коротко по существу, без эмодзи. 
+    Не используй в ответах специальных разделителей, только простой текст. Длинный ответы дели на 
+    части. Отправляй продолжение, когда просят: дальше или продолжи.
+    У тебя есть доступ к функции поиска в интернете через Google Custom Search. 
+    Если тебе нужна актуальная информация из интернета или пользователь просит найти что-то, 
+    используй функцию search_internet. Важно: поиск выполняется только после подтверждения 
+    пользователем. Сформулируй поисковый запрос максимально точно и информативно.';
     private const QUICK_RESPONSE_TIMEOUT = 4.3; // keep initial round-trip under Alice 4.5s SLA
     private const MAX_WAIT_SECONDS = 30.0;
     private const WAITING_MESSAGE = 'Надо подумать. Через несколько секунд скажите: Готово?';
@@ -18,11 +23,11 @@ class AliceHandler
 
     private Client $client;
     private string $model_id;
+    private int $max_tokens;
     private string $apiKey;
     private string $pendingDir;
     private string $conversationDir;
     private array $modelList = [];
-    private int $modelIndex = 0;
     private string $modelStatePath;
 
     private const MODEL_SWITCH_TRIGGERS = [
@@ -178,9 +183,78 @@ class AliceHandler
             }
 
             try {
-                $aiPayload = $this->requestAiResponse($history, self::QUICK_RESPONSE_TIMEOUT);
-                $responseTemplate['response']['text'] = $this->truncateResponse($aiPayload['text']);
-                $history[] = $aiPayload['message'];
+                $maxIterations = 3;
+                $iteration = 0;
+                $finalResponse = null;
+                $requestStartTime = microtime(true); // Время начала обработки запроса от Алисы
+
+                while ($iteration < $maxIterations) {
+                    // Проверяем, не превысили ли мы общее время с начала запроса
+                    $elapsed = microtime(true) - $requestStartTime;
+                    if ($elapsed >= self::QUICK_RESPONSE_TIMEOUT) {
+                        // Превысили таймаут - отправляем WAITING_MESSAGE и продолжаем в фоне
+                        $pendingState = $this->createPendingState($sessionId, $history);
+                        $responseTemplate['response']['text'] = self::WAITING_MESSAGE;
+                        $this->sendResponse($responseTemplate);
+                        $this->releaseSession();
+                        $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
+                        return;
+                    }
+                    
+                    // Вычисляем оставшееся время для запроса
+                    $remainingTime = max(1.0, self::QUICK_RESPONSE_TIMEOUT - $elapsed);
+                    $aiPayload = $this->requestAiResponse($history, $remainingTime);
+                    
+                    // Сохраняем сообщение ассистента в историю
+                    $history[] = $aiPayload['message'];
+                    
+                    // Проверяем наличие tool_calls
+                    if (!empty($aiPayload['tool_calls']) && is_array($aiPayload['tool_calls'])) {
+                        // Выполняем вызовы функций
+                        $this->processFunctionCalls($aiPayload['tool_calls'], $history);
+                        $this->saveConversation($sessionId, $history);
+                        $iteration++;
+                        
+                        // Проверяем время снова после выполнения функций (поиск мог занять время)
+                        $elapsed = microtime(true) - $requestStartTime;
+                        if ($elapsed >= self::QUICK_RESPONSE_TIMEOUT) {
+                            $pendingState = $this->createPendingState($sessionId, $history);
+                            $responseTemplate['response']['text'] = self::WAITING_MESSAGE;
+                            $this->sendResponse($responseTemplate);
+                            $this->releaseSession();
+                            $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
+                            return;
+                        }
+                        
+                        // Продолжаем цикл для получения финального ответа
+                        continue;
+                    }
+                    
+                    // Если нет tool_calls, это финальный ответ
+                    $finalResponse = $aiPayload;
+                    break;
+                }
+
+                // Если достигнут лимит итераций, используем последний ответ
+                if ($finalResponse === null && !empty($history)) {
+                    // Берем последнее сообщение ассистента
+                    $lastMessage = end($history);
+                    if ($lastMessage['role'] === 'assistant') {
+                        $finalResponse = [
+                            'text' => $this->buildDisplayTextFromParts($lastMessage['content'] ?? []),
+                            'message' => $lastMessage
+                        ];
+                    }
+                }
+
+                if ($finalResponse === null) {
+                    $finalResponse = [
+                        'text' => 'Не удалось получить ответ от модели',
+                        'message' => $this->createAssistantMessageFromText('Не удалось получить ответ от модели')
+                    ];
+                }
+
+                $responseTemplate['response']['text'] = $this->truncateResponse($finalResponse['text']);
                 $this->saveConversation($sessionId, $history);
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
@@ -250,7 +324,7 @@ class AliceHandler
         }
 
         $newModelId = $this->switchToNextModel();
-        $switchText = 'переключаю на: ' . $this->displayModelName($newModelId) . ' модели.';
+        $switchText = 'переключаю на: ' . $this->displayModelName($newModelId);
         $history[] = $this->createAssistantMessageFromText($switchText);
         $this->saveConversation($sessionId, $history);
         $responseTemplate['response']['text'] = $switchText;
@@ -282,18 +356,34 @@ class AliceHandler
             return $this->model_id;
         }
 
-        $total = count($this->modelList);
-        $this->modelIndex = ($this->modelIndex + 1) % $total;
-        $this->model_id = $this->modelList[$this->modelIndex];
+        // Получаем все ключи (model_id) из массива
+        $keys = array_keys($this->modelList);
+        
+        // Находим текущую позицию
+        $currentKey = array_search($this->model_id, $keys, true);
+        
+        if ($currentKey === false) {
+            // Если текущий model_id не найден, берем первый
+            $currentKey = 0;
+        } else {
+            // Переходим к следующему (с зацикливанием)
+            $currentKey = ($currentKey + 1) % count($keys);
+        }
+        
+        $nextModelId = $keys[$currentKey];
+        $model = $this->modelList[$nextModelId];
+        
+        $this->model_id = $model[0];
+        $this->max_tokens = $model[1];
         $this->persistModelState($this->model_id);
-
+        
         return $this->model_id;
     }
 
     private function buildGreetingMessage(): string
     {
         $displayName = $this->displayModelName($this->model_id);
-        return sprintf('%s на связи! Спроси что угодно или скажи «помощь», чтобы услышать инструкцию.', $displayName);
+        return sprintf('Говорит %s! Спроси что угодно или скажи «помощь», чтобы услышать инструкцию.', $displayName);
     }
 
     private function displayModelName(string $modelId): string
@@ -322,9 +412,11 @@ class AliceHandler
 
         $models = [];
         foreach ($lines as $line) {
-            $name = trim($line);
+            list($name, $max_tokens) = explode(" ", $line, 2);
+            $name = trim($name);
+            $max_tokens = (int)trim($max_tokens);
             if ($name !== '') {
-                $models[] = $name;
+                $models[$name] = [$name, $max_tokens];
             }
         }
 
@@ -334,20 +426,22 @@ class AliceHandler
     private function syncModelState(): void
     {
         if (empty($this->modelList)) {
-            $this->modelIndex = 0;
             return;
         }
 
         $storedModel = $this->loadModelState();
-        if ($storedModel !== null && in_array($storedModel, $this->modelList, true)) {
+        if ($storedModel !== null && isset($this->modelList[$storedModel])) {
             $this->model_id = $storedModel;
-        } elseif (!in_array($this->model_id, $this->modelList, true)) {
-            $this->model_id = $this->modelList[0];
+        } elseif (!isset($this->modelList[$this->model_id])) {
+            $this->model_id = array_key_first($this->modelList);
         }
 
-        $index = array_search($this->model_id, $this->modelList, true);
-        $this->modelIndex = ($index === false) ? 0 : $index;
-        $this->model_id = $this->modelList[$this->modelIndex];
+        // Проверяем, существует ли текущий model_id в массиве
+        if (!isset($this->modelList[$this->model_id])) {
+            // Если не существует, берем первый доступный
+            $this->model_id = array_key_first($this->modelList);
+        }
+
         $this->persistModelState($this->model_id);
     }
 
@@ -389,6 +483,7 @@ class AliceHandler
         $payload = [
             'model' => $this->model_id,
             'messages' => $messages,
+            'tools' => $this->buildToolsDefinition(),
         ];
         $this->logAiRequest($payload);
 
@@ -426,13 +521,61 @@ class AliceHandler
                 return;
             }
 
-            $responsePayload = $this->requestAiResponse($history, $remaining);
-            $this->appendAssistantMessage($sessionId, $responsePayload['message']);
+            $maxIterations = 3;
+            $iteration = 0;
+            $finalResponse = null;
+
+            while ($iteration < $maxIterations) {
+                $responsePayload = $this->requestAiResponse($history, $remaining);
+                
+                // Сохраняем сообщение ассистента в историю
+                $history[] = $responsePayload['message'];
+                
+                // Проверяем наличие tool_calls
+                if (!empty($responsePayload['tool_calls']) && is_array($responsePayload['tool_calls'])) {
+                    // Выполняем вызовы функций
+                    $this->processFunctionCalls($responsePayload['tool_calls'], $history);
+                    $this->saveConversation($sessionId, $history);
+                    $iteration++;
+                    // Обновляем оставшееся время
+                    $remaining = $deadline - microtime(true);
+                    if ($remaining <= 0) {
+                        break;
+                    }
+                    // Продолжаем цикл для получения финального ответа
+                    continue;
+                }
+                
+                // Если нет tool_calls, это финальный ответ
+                $finalResponse = $responsePayload;
+                break;
+            }
+
+            // Если достигнут лимит итераций, используем последний ответ
+            if ($finalResponse === null && !empty($history)) {
+                // Берем последнее сообщение ассистента
+                $lastMessage = end($history);
+                if ($lastMessage['role'] === 'assistant') {
+                    $finalResponse = [
+                        'text' => $this->buildDisplayTextFromParts($lastMessage['content'] ?? []),
+                        'message' => $lastMessage
+                    ];
+                }
+            }
+
+            if ($finalResponse === null) {
+                $finalResponse = [
+                    'text' => 'Не удалось получить ответ от модели',
+                    'message' => $this->createAssistantMessageFromText('Не удалось получить ответ от модели')
+                ];
+            }
+
+            $this->saveConversation($sessionId, $history);
             $this->savePendingState($sessionId, [
                 'status' => 'ready',
                 'started_at' => $startedAt,
                 'history' => $history,
-                'response' => $responsePayload,
+                'response' => $finalResponse,
                 'conversation_updated' => true
             ]);
         } catch (ConnectException $e) {
@@ -571,10 +714,34 @@ class AliceHandler
                 continue;
             }
 
-            $messages[] = [
-                'role' => $entry['role'],
-                'content' => $this->normalizeContentParts($entry['content'] ?? [])
-            ];
+            $role = $entry['role'];
+            
+            // Для tool сообщений нужна особая обработка
+            if ($role === 'tool') {
+                $message = [
+                    'role' => 'tool',
+                    'tool_call_id' => $entry['tool_call_id'] ?? '',
+                    'content' => $entry['content'] ?? ''
+                ];
+                // Если content - массив, преобразуем в строку
+                if (is_array($message['content'])) {
+                    $message['content'] = json_encode($message['content'], JSON_UNESCAPED_UNICODE);
+                }
+                $messages[] = $message;
+            } else {
+                // Для остальных ролей (user, assistant, system)
+                $message = [
+                    'role' => $role,
+                    'content' => $this->normalizeContentParts($entry['content'] ?? [])
+                ];
+                
+                // Добавляем tool_calls, если они есть (для assistant сообщений)
+                if (!empty($entry['tool_calls']) && is_array($entry['tool_calls'])) {
+                    $message['tool_calls'] = $entry['tool_calls'];
+                }
+                
+                $messages[] = $message;
+            }
         }
 
         return $messages;
@@ -688,14 +855,24 @@ class AliceHandler
         if (!empty($response['choices'][0]['message'])) {
             $message = $response['choices'][0]['message'];
             $parts = $this->normalizeContentParts($message['content'] ?? []);
+            
+            $result = [
+                'text' => $this->buildDisplayTextFromParts($parts),
+                'message' => [
+                    'role' => $message['role'] ?? 'assistant',
+                    'content' => $parts
+                ]
+            ];
+
+            // Извлекаем tool_calls, если они есть
+            if (!empty($message['tool_calls']) && is_array($message['tool_calls'])) {
+                $result['tool_calls'] = $message['tool_calls'];
+                // Добавляем tool_calls в сообщение для сохранения в истории
+                $result['message']['tool_calls'] = $message['tool_calls'];
+            }
+
             if (!empty($parts)) {
-                return [
-                    'text' => $this->buildDisplayTextFromParts($parts),
-                    'message' => [
-                        'role' => $message['role'] ?? 'assistant',
-                        'content' => $parts
-                    ]
-                ];
+                return $result;
             }
         }
 
@@ -1041,6 +1218,169 @@ class AliceHandler
         }
 
         return (string) $code;
+    }
+
+    private function performGoogleSearch(string $query): array
+    {
+        $apiKey = $_ENV['GOOGLE_API_KEY'] ?? '';
+        $cx = $_ENV['GOOGLE_CX'] ?? '';
+
+        if ($apiKey === '' || $cx === '') {
+            error_log('Google Custom Search API credentials not configured');
+            return [
+                'error' => 'Поиск не настроен. Отсутствуют ключи API.',
+                'results' => []
+            ];
+        }
+
+        try {
+            $url = 'https://www.googleapis.com/customsearch/v1';
+            $params = [
+                'key' => $apiKey,
+                'cx' => $cx,
+                'q' => $query,
+                'num' => 5
+            ];
+
+            $searchClient = new Client([
+                'timeout' => 10.0,
+                'connect_timeout' => 5.0
+            ]);
+
+            $response = $searchClient->get($url, ['query' => $params]);
+            $body = json_decode($response->getBody(), true);
+
+            if (!is_array($body)) {
+                error_log('Invalid Google Custom Search API response');
+                return [
+                    'error' => 'Неверный ответ от поискового API',
+                    'results' => []
+                ];
+            }
+
+            if (isset($body['error'])) {
+                $errorMessage = $body['error']['message'] ?? 'Неизвестная ошибка Google API';
+                error_log('Google Custom Search API error: ' . $errorMessage);
+                return [
+                    'error' => 'Ошибка поиска: ' . $errorMessage,
+                    'results' => []
+                ];
+            }
+
+            $results = [];
+            $items = $body['items'] ?? [];
+
+            foreach ($items as $item) {
+                $results[] = [
+                    'title' => $item['title'] ?? '',
+                    'link' => $item['link'] ?? '',
+                    'snippet' => $item['snippet'] ?? ''
+                ];
+            }
+
+            $totalResults = isset($body['searchInformation']['totalResults']) 
+                ? (int)$body['searchInformation']['totalResults'] 
+                : 0;
+
+            return [
+                'results' => $results,
+                'total_results' => $totalResults
+            ];
+        } catch (ConnectException $e) {
+            error_log('Google Custom Search connection error: ' . $e->getMessage());
+            return [
+                'error' => 'Ошибка соединения с поисковым сервисом',
+                'results' => []
+            ];
+        } catch (RequestException $e) {
+            $errorMessage = 'Ошибка запроса к поисковому API';
+            if ($e->hasResponse()) {
+                $responseBody = (string) $e->getResponse()->getBody();
+                $errorData = json_decode($responseBody, true);
+                if (isset($errorData['error']['message'])) {
+                    $errorMessage = $errorData['error']['message'];
+                }
+            }
+            error_log('Google Custom Search API request error: ' . $errorMessage);
+            return [
+                'error' => 'Ошибка поиска: ' . $errorMessage,
+                'results' => []
+            ];
+        } catch (\Throwable $e) {
+            error_log('Google Custom Search unexpected error: ' . $e->getMessage());
+            return [
+                'error' => 'Неожиданная ошибка при выполнении поиска',
+                'results' => []
+            ];
+        }
+    }
+
+    private function buildToolsDefinition(): array
+    {
+        return [
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'search_internet',
+                    'description' => 'Выполняет поиск в интернете через Google Custom Search. Используй эту функцию, когда нужна актуальная информация из интернета или когда пользователь явно просит найти что-то в интернете.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'query' => [
+                                'type' => 'string',
+                                'description' => 'Поисковый запрос для Google Custom Search. Сформулируй запрос максимально точно и информативно.'
+                            ]
+                        ],
+                        'required' => ['query']
+                    ]
+                ]
+            ]
+        ];
+    }
+
+    private function processFunctionCalls(array $toolCalls, array &$history): void
+    {
+        foreach ($toolCalls as $toolCall) {
+            if (!is_array($toolCall)) {
+                continue;
+            }
+
+            $functionName = $toolCall['function']['name'] ?? '';
+            $toolCallId = $toolCall['id'] ?? '';
+            $argumentsJson = $toolCall['function']['arguments'] ?? '{}';
+
+            if ($functionName === 'search_internet') {
+                $arguments = json_decode($argumentsJson, true);
+                if (!is_array($arguments) || empty($arguments['query'])) {
+                    error_log('Invalid search_internet arguments: ' . $argumentsJson);
+                    $result = [
+                        'error' => 'Неверный формат запроса поиска',
+                        'results' => []
+                    ];
+                } else {
+                    $query = trim($arguments['query']);
+                    error_log('Executing Google search for query: ' . $query);
+                    $result = $this->performGoogleSearch($query);
+                }
+
+                // Добавляем результат функции в историю
+                $history[] = [
+                    'role' => 'tool',
+                    'tool_call_id' => $toolCallId,
+                    'content' => json_encode($result, JSON_UNESCAPED_UNICODE)
+                ];
+            } else {
+                error_log('Unknown function call: ' . $functionName);
+                // Возвращаем ошибку для неизвестной функции
+                $history[] = [
+                    'role' => 'tool',
+                    'tool_call_id' => $toolCallId,
+                    'content' => json_encode([
+                        'error' => 'Неизвестная функция: ' . $functionName
+                    ], JSON_UNESCAPED_UNICODE)
+                ];
+            }
+        }
     }
 
     private function sendResponse(array $responseData): void
