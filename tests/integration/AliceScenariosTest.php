@@ -4,16 +4,19 @@ require_once __DIR__ . '/../bootstrap.php';
 require_once __DIR__ . '/../../alice_handler.php';
 
 use PHPUnit\Framework\TestCase;
-use GuzzleHttp\Client;
-use GuzzleHttp\Handler\MockHandler;
-use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Psr7\Response;
+use React\Http\Browser;
+use React\EventLoop\Loop;
+use React\EventLoop\LoopInterface;
+use React\Promise\PromiseInterface;
+use React\Http\Message\Response;
+use Psr\Http\Message\ResponseInterface;
 
 class AliceScenariosTest extends TestCase
 {
         private string $tempDir;
         private string $originalEnvKey;
-        private ?Client $mockClient = null;
+        private ?Browser $mockClient = null;
+        private ?LoopInterface $loop = null;
 
         protected function setUp(): void
         {
@@ -35,6 +38,8 @@ class AliceScenariosTest extends TestCase
                         $_SERVER['REQUEST_METHOD'] = 'POST';
                 }
                 unset($GLOBALS['__PHP_INPUT_MOCK__']);
+                
+                $this->loop = Loop::get();
         }
 
         protected function tearDown(): void
@@ -78,14 +83,10 @@ class AliceScenariosTest extends TestCase
                 return $data;
         }
 
-        private function setupMockGoogleSearchClient(): Client
+        private function setupMockGoogleSearchClient(): Browser
         {
                 $googleResponse = $this->loadFixture('google_search_response.json');
-                $mockHandler = new MockHandler([
-                        new Response(200, ['Content-Type' => 'application/json'], json_encode($googleResponse))
-                ]);
-                $handlerStack = HandlerStack::create($mockHandler);
-                return new Client(['handler' => $handlerStack]);
+                return $this->createMockBrowser([$googleResponse]);
         }
 
         private function setupMockClient(array $responses, ?int $delayMicroseconds = null): void
@@ -95,22 +96,66 @@ class AliceScenariosTest extends TestCase
                         if (is_string($response)) {
                                 $response = $this->loadFixture($response);
                         }
-                        $mockResponses[] = new Response(200, ['Content-Type' => 'application/json'], json_encode($response));
-                }
-
-                $mockHandler = new MockHandler($mockResponses);
-                $handlerStack = HandlerStack::create($mockHandler);
-                
-                if ($delayMicroseconds !== null) {
-                        $handlerStack->push(function (callable $handler) use ($delayMicroseconds) {
-                                return function ($request, array $options) use ($handler, $delayMicroseconds) {
-                                        usleep($delayMicroseconds);
-                                        return $handler($request, $options);
-                                };
-                        });
+                        $mockResponses[] = $response;
                 }
                 
-                $this->mockClient = new Client(['handler' => $handlerStack]);
+                $this->mockClient = $this->createMockBrowser($mockResponses, $delayMicroseconds);
+        }
+        
+        private function createMockBrowser(array $responses, ?int $delayMicroseconds = null): Browser
+        {
+                $loop = $this->loop ?? Loop::get();
+                $responseIndex = 0;
+                
+                // Создаем мок Browser через наследование или композицию
+                // Используем простой подход - создаем Browser с переопределенными методами
+                $mockBrowser = $this->createMock(Browser::class);
+                
+                $mockBrowser->method('get')->willReturnCallback(function ($url) use (&$responseIndex, $responses, $delayMicroseconds, $loop) {
+                        $deferred = new \React\Promise\Deferred();
+                        
+                        if ($delayMicroseconds !== null) {
+                                $loop->addTimer($delayMicroseconds / 1000000.0, function () use ($deferred, &$responseIndex, $responses) {
+                                        $response = $responses[$responseIndex] ?? [];
+                                        $responseIndex++;
+                                        $responseBody = json_encode($response);
+                                        $httpResponse = new Response(200, ['Content-Type' => 'application/json'], $responseBody);
+                                        $deferred->resolve($httpResponse);
+                                });
+                        } else {
+                                $response = $responses[$responseIndex] ?? [];
+                                $responseIndex++;
+                                $responseBody = json_encode($response);
+                                $httpResponse = new Response(200, ['Content-Type' => 'application/json'], $responseBody);
+                                $deferred->resolve($httpResponse);
+                        }
+                        
+                        return $deferred->promise();
+                });
+                
+                $mockBrowser->method('post')->willReturnCallback(function ($url, $headers, $body) use (&$responseIndex, $responses, $delayMicroseconds, $loop) {
+                        $deferred = new \React\Promise\Deferred();
+                        
+                        if ($delayMicroseconds !== null) {
+                                $loop->addTimer($delayMicroseconds / 1000000.0, function () use ($deferred, &$responseIndex, $responses) {
+                                        $response = $responses[$responseIndex] ?? [];
+                                        $responseIndex++;
+                                        $responseBody = json_encode($response);
+                                        $httpResponse = new Response(200, ['Content-Type' => 'application/json'], $responseBody);
+                                        $deferred->resolve($httpResponse);
+                                });
+                        } else {
+                                $response = $responses[$responseIndex] ?? [];
+                                $responseIndex++;
+                                $responseBody = json_encode($response);
+                                $httpResponse = new Response(200, ['Content-Type' => 'application/json'], $responseBody);
+                                $deferred->resolve($httpResponse);
+                        }
+                        
+                        return $deferred->promise();
+                });
+                
+                return $mockBrowser;
         }
 
         private function mockPhpInput(array $input): void
@@ -180,7 +225,7 @@ class AliceScenariosTest extends TestCase
                 $this->mockPhpInput($input);
 
                 $output = $this->captureOutput(function () {
-                        $handler = new AliceHandler($this->mockClient);
+                        $handler = new AliceHandler($this->mockClient, null, $this->loop);
                         $handler->handleRequest();
                 });
 
@@ -208,7 +253,7 @@ class AliceScenariosTest extends TestCase
                 $this->setupMockClient(['openrouter_initial_response.json']);
 
                 $output1 = $this->captureOutput(function () {
-                        $handler = new AliceHandler($this->mockClient);
+                        $handler = new AliceHandler($this->mockClient, null, $this->loop);
                         $handler->handleRequest();
                 });
 
@@ -236,7 +281,7 @@ class AliceScenariosTest extends TestCase
                 $output2 = '';
                 try {
                         $output2 = $this->captureOutput(function () {
-                                $handler = new AliceHandler($this->mockClient);
+                                $handler = new AliceHandler($this->mockClient, null, $this->loop);
                                 $handler->handleRequest();
                         });
                 } catch (\Throwable $e) {
@@ -275,7 +320,7 @@ class AliceScenariosTest extends TestCase
                 $this->mockPhpInput($input);
 
                 $output = $this->captureOutput(function () {
-                        $handler = new AliceHandler($this->mockClient);
+                        $handler = new AliceHandler($this->mockClient, null, $this->loop);
                         $handler->handleRequest();
                 });
 
@@ -309,7 +354,7 @@ class AliceScenariosTest extends TestCase
                 $mockGoogleClient = $this->setupMockGoogleSearchClient();
 
                 $output = $this->captureOutput(function () use ($mockGoogleClient) {
-                        $handler = new AliceHandler($this->mockClient, $mockGoogleClient);
+                        $handler = new AliceHandler($this->mockClient, $mockGoogleClient, $this->loop);
                         $handler->handleRequest();
                 });
 

@@ -3,6 +3,8 @@
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
+use React\Http\Browser;
+use React\EventLoop\Loop;
 
 const SEARCH_TIMEOUT = 10.0;
 const SEARCH_CONNECT_TIMEOUT = 5.0;
@@ -30,7 +32,7 @@ function build_tools_definition(): array
         ];
 }
 
-function perform_google_search(string $query, ?Client $mockClient = null): array
+function perform_google_search(string $query, ?Browser $mockClient = null): array
 {
         $apiKey = $_ENV['GOOGLE_API_KEY'] ?? '';
         $cx = $_ENV['GOOGLE_CX'] ?? '';
@@ -51,18 +53,47 @@ function perform_google_search(string $query, ?Client $mockClient = null): array
                         'q' => $query,
                         'num' => 5
                 ];
+                $urlWithParams = $url . '?' . http_build_query($params);
 
+                $loop = Loop::get();
+                $result = null;
+                $promiseResolved = false;
+                
                 if ($mockClient !== null) {
                         $searchClient = $mockClient;
                 } else {
-                        $searchClient = new Client([
-                                'timeout' => SEARCH_TIMEOUT,
-                                'connect_timeout' => SEARCH_CONNECT_TIMEOUT
-                        ]);
+                        require_once __DIR__ . '/config.php';
+                        $searchClient = create_openrouter_react_client($loop);
                 }
 
-                $response = $searchClient->get($url, ['query' => $params]);
-                $body = json_decode($response->getBody(), true);
+                $promise = $searchClient->get($urlWithParams);
+                $promise->then(function ($response) use (&$result, &$promiseResolved, $loop) {
+                        $body = json_decode((string)$response->getBody(), true);
+                        $result = $body;
+                        $promiseResolved = true;
+                        $loop->stop();
+                })->otherwise(function ($e) use (&$result, &$promiseResolved, $loop) {
+                        error_log('Google Custom Search error: ' . $e->getMessage());
+                        $result = ['error' => ['message' => $e->getMessage()]];
+                        $promiseResolved = true;
+                        $loop->stop();
+                });
+                
+                // Блокируем выполнение до получения результата
+                $endTime = microtime(true) + SEARCH_TIMEOUT;
+                while (!$promiseResolved && microtime(true) < $endTime) {
+                        $loop->run();
+                }
+                
+                if (!$promiseResolved) {
+                        error_log('Google Custom Search timeout');
+                        return [
+                                'error' => 'Таймаут при выполнении поиска',
+                                'results' => []
+                        ];
+                }
+                
+                $body = $result;
 
                 if (!is_array($body)) {
                         error_log('Invalid Google Custom Search API response');
@@ -100,26 +131,6 @@ function perform_google_search(string $query, ?Client $mockClient = null): array
                         'results' => $results,
                         'total_results' => $totalResults
                 ];
-        } catch (ConnectException $e) {
-                error_log('Google Custom Search connection error: ' . $e->getMessage());
-                return [
-                        'error' => 'Ошибка соединения с поисковым сервисом',
-                        'results' => []
-                ];
-        } catch (RequestException $e) {
-                $errorMessage = 'Ошибка запроса к поисковому API';
-                if ($e->hasResponse()) {
-                        $responseBody = (string) $e->getResponse()->getBody();
-                        $errorData = json_decode($responseBody, true);
-                        if (isset($errorData['error']['message'])) {
-                                $errorMessage = $errorData['error']['message'];
-                        }
-                }
-                error_log('Google Custom Search API request error: ' . $errorMessage);
-                return [
-                        'error' => 'Ошибка поиска: ' . $errorMessage,
-                        'results' => []
-                ];
         } catch (\Throwable $e) {
                 error_log('Google Custom Search unexpected error: ' . $e->getMessage());
                 return [
@@ -129,7 +140,7 @@ function perform_google_search(string $query, ?Client $mockClient = null): array
         }
 }
 
-function process_function_calls(array $toolCalls, array &$history, ?Client $mockSearchClient = null): void
+function process_function_calls(array $toolCalls, array &$history, ?Browser $mockSearchClient = null): void
 {
         foreach ($toolCalls as $toolCall) {
                 if (!is_array($toolCall)) {

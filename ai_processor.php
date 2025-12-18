@@ -5,14 +5,13 @@ require_once 'message_builder.php';
 require_once 'tool_handler.php';
 require_once 'error_formatter.php';
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ConnectException;
-use GuzzleHttp\Exception\RequestException;
+use React\Http\Browser;
+use React\Promise\PromiseInterface;
+use React\Promise\Deferred;
+use Psr\Http\Message\ResponseInterface;
 
-const MAX_HTTP_TIMEOUT = 4.0;
+
 const MAX_CONNECT_TIMEOUT = 3.0;
-const MIN_TIMEOUT = 1.0;
-
 function log_ai_request(array $payload): void
 {
         $clone = $payload;
@@ -62,11 +61,9 @@ function extract_response_payload(array $response): array
         ];
 }
 
-function request_ai_response(Client $client, string $modelId, array $history, float $timeoutSeconds): array
+function request_ai_response(Browser $client, string $modelId, array $history, float $timeoutSeconds, \React\EventLoop\LoopInterface $loop): PromiseInterface
 {
         $messages = build_messages($history);
-        $timeout = max(MIN_TIMEOUT, min($timeoutSeconds, MAX_HTTP_TIMEOUT));
-
         $payload = [
                 'model' => $modelId,
                 'messages' => $messages,
@@ -74,76 +71,177 @@ function request_ai_response(Client $client, string $modelId, array $history, fl
         ];
         log_ai_request($payload);
 
-        $response = $client->post('chat/completions', [
-                'timeout' => $timeout,
-                'connect_timeout' => min(MAX_CONNECT_TIMEOUT, $timeout),
-                'json' => $payload,
-        ]);
+        $baseUri = get_openrouter_base_uri();
+        $headers = get_openrouter_headers();
+        $url = $baseUri . 'chat/completions';
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
 
-        $body = json_decode($response->getBody(), true);
-        return extract_response_payload($body);
+        $promise = $client->post($url, $headers, $body);
+
+        // Добавляем таймаут для запроса
+        $deferred = new Deferred();
+        $timeoutTimer = null;
+
+        $promise->then(
+                function (ResponseInterface $response) use ($deferred, &$timeoutTimer, $loop) {
+                        if ($timeoutTimer !== null) {
+                                $loop->cancelTimer($timeoutTimer);
+                        }
+                        $responseBody = (string)$response->getBody();
+                        $data = json_decode($responseBody, true);
+                        if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
+                                $deferred->reject(new \RuntimeException('Invalid JSON response from OpenRouter'));
+                                return;
+                        }
+                        $result = extract_response_payload($data);
+                        $deferred->resolve($result);
+                },
+                function (\Throwable $error) use ($deferred, &$timeoutTimer, $loop) {
+                        if ($timeoutTimer !== null) {
+                                $loop->cancelTimer($timeoutTimer);
+                        }
+                        $deferred->reject($error);
+                }
+        );
+
+        // Устанавливаем таймаут
+        $timeoutTimer = $loop->addTimer($timeoutSeconds, function () use ($deferred, &$timeoutTimer) {
+                $timeoutTimer = null;
+                $deferred->reject(new \RuntimeException('Request timeout after ' . $timeoutSeconds . ' seconds'));
+        });
+
+        return $deferred->promise();
 }
 
 function process_ai_request_loop(
-        Client $client,
+        Browser $client,
         string $modelId,
         array &$history,
         float $startTime,
         float $deadline,
         callable $saveConversationCallback,
-        callable $processFunctionCallsCallback
-): ?array {
+        callable $processFunctionCallsCallback,
+        \React\EventLoop\LoopInterface $loop
+): PromiseInterface {
         $maxIterations = 3;
-        $iteration = 0;
-        $finalResponse = null;
-
-        while ($iteration < $maxIterations) {
+        
+        // Рекурсивная функция для обработки итераций
+        $processIteration = function ($iteration) use (
+                &$processIteration,
+                $client,
+                $modelId,
+                &$history,
+                $startTime,
+                $deadline,
+                $saveConversationCallback,
+                $processFunctionCallsCallback,
+                $loop,
+                $maxIterations
+        ): PromiseInterface {
+                // Проверяем deadline
                 $elapsed = microtime(true) - $startTime;
-                if ($elapsed >= $deadline) {
-                        break;
-                }
-                
-                $remainingTime = max(MIN_TIMEOUT, $deadline - $elapsed);
-                if ($remainingTime <= 0) {
-                        break;
-                }
-                
-                try {
-                        $aiPayload = request_ai_response($client, $modelId, $history, $remainingTime);
-                } catch (\Throwable $e) {
-                        error_log('Error in request_ai_response: ' . $e->getMessage());
-                        break;
-                }
-                
-                $history[] = $aiPayload['message'];
-                
-                if (!empty($aiPayload['tool_calls']) && is_array($aiPayload['tool_calls'])) {
-                        $processFunctionCallsCallback($aiPayload['tool_calls'], $history);
-                        $saveConversationCallback($history);
-                        $iteration++;
-                        
-                        $elapsed = microtime(true) - $startTime;
-                        if ($elapsed >= $deadline) {
-                                break;
+                if ($elapsed >= $deadline || $iteration >= $maxIterations) {
+                        // Таймаут или достигнут лимит итераций
+                        if (!empty($history)) {
+                                $lastMessage = end($history);
+                                if ($lastMessage['role'] === 'assistant') {
+                                        $finalResponse = [
+                                                'text' => build_display_text_from_parts($lastMessage['content'] ?? []),
+                                                'message' => $lastMessage
+                                        ];
+                                        return \React\Promise\resolve($finalResponse);
+                                }
                         }
-                        
-                        continue;
+                        $errorResponse = [
+                                'text' => 'Не удалось получить ответ от модели: превышено время ожидания',
+                                'message' => create_assistant_message_from_text('Не удалось получить ответ от модели: превышено время ожидания')
+                        ];
+                        return \React\Promise\resolve($errorResponse);
                 }
                 
-                $finalResponse = $aiPayload;
-                break;
-        }
-
-        if ($finalResponse === null && !empty($history)) {
-                $lastMessage = end($history);
-                if ($lastMessage['role'] === 'assistant') {
-                        $finalResponse = [
-                                'text' => build_display_text_from_parts($lastMessage['content'] ?? []),
-                                'message' => $lastMessage
+                // Пересчитываем оставшееся время для запроса
+                $remainingTime = $deadline - microtime(true);
+                if ($remainingTime <= 0) {
+                        $errorResponse = [
+                                'text' => 'Не удалось получить ответ от модели: превышено время ожидания',
+                                'message' => create_assistant_message_from_text('Не удалось получить ответ от модели: превышено время ожидания')
                         ];
+                        return \React\Promise\resolve($errorResponse);
                 }
-        }
+                
+                // Запускаем запрос к AI
+                return request_ai_response($client, $modelId, $history, $remainingTime, $loop)
+                        ->then(function ($aiPayload) use (
+                                &$history,
+                                $processFunctionCallsCallback,
+                                $saveConversationCallback,
+                                &$processIteration,
+                                $iteration,
+                                $startTime,
+                                $deadline,
+                                $loop
+                        ) {
+                                $history[] = $aiPayload['message'];
+                                
+                                // Если есть tool calls - обрабатываем их и продолжаем итерацию
+                                if (!empty($aiPayload['tool_calls']) && is_array($aiPayload['tool_calls'])) {
+                                        $processFunctionCallsCallback($aiPayload['tool_calls'], $history);
+                                        $saveConversationCallback($history);
+                                        
+                                        // Проверяем deadline перед следующей итерацией
+                                        $elapsed = microtime(true) - $startTime;
+                                        if ($elapsed >= $deadline) {
+                                                return \React\Promise\resolve($aiPayload);
+                                        }
+                                        
+                                        // Продолжаем следующую итерацию
+                                        return $processIteration($iteration + 1);
+                                }
+                                
+                                // Финальный ответ получен
+                                return \React\Promise\resolve($aiPayload);
+                        })
+                        ->otherwise(function (\Throwable $e) {
+                                error_log('Error in request_ai_response: ' . $e->getMessage());
+                                $errorMessage = format_ai_error($e);
+                                return [
+                                        'text' => $errorMessage,
+                                        'message' => create_assistant_message_from_text($errorMessage)
+                                ];
+                        });
+        };
+        
+        return $processIteration(0);
+}
 
-        return $finalResponse;
+function format_ai_error(\Throwable $e): string
+{
+        // Проверяем на таймаут
+        if ($e instanceof \RuntimeException && strpos($e->getMessage(), 'timeout') !== false) {
+                return 'Не удалось получить ответ от модели: превышено время ожидания';
+        }
+        
+        // Проверяем на ошибки соединения
+        if ($e instanceof \RuntimeException && (strpos($e->getMessage(), 'connection') !== false || strpos($e->getMessage(), 'Connection') !== false)) {
+                return 'Не удалось получить ответ от модели: ошибка соединения';
+        }
+        
+        // Для обратной совместимости с Guzzle исключениями (если они еще используются)
+        if ($e instanceof \GuzzleHttp\Exception\ConnectException) {
+                $errno = get_curl_errno($e);
+                if (is_timeout_errno($errno)) {
+                        return 'Не удалось получить ответ от модели: превышено время ожидания';
+                }
+                return format_connect_error($e);
+        }
+        
+        if ($e instanceof \GuzzleHttp\Exception\RequestException) {
+                if (is_timeout_exception($e)) {
+                        return 'Не удалось получить ответ от модели: превышено время ожидания';
+                }
+                return format_request_error($e);
+        }
+        
+        return 'Не удалось получить ответ от модели: ' . $e->getMessage();
 }
 

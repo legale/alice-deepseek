@@ -11,14 +11,18 @@ require_once 'ai_processor.php';
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
+use React\Http\Browser;
+use React\EventLoop\LoopInterface;
+use React\EventLoop\Loop;
+use React\Promise\PromiseInterface;
 
 class AliceHandler
 {
     private const SESSION_RESET_MESSAGE = 'Ответ так и не сформировался, давайте попробуем заново.';
     private const MAX_RESPONSE_LENGTH = 1024;
 
-    private Client $client;
-    private ?Client $mockSearchClient;
+    private Browser $client;
+    private ?Browser $mockSearchClient;
     private string $model_id;
     private int $max_tokens;
     private string $apiKey;
@@ -40,7 +44,7 @@ class AliceHandler
     со мной можно вести длинный разговор на любую тему! Держу большой контекст (132к), а если GPT-OSS надоест, могу переключатся
      между моделями, не теряя нить разговора. Спроси что угодно или скажи «переключи модель», чтобы выбрать другую модель.';
 
-    public function __construct(?Client $client = null, ?Client $mockSearchClient = null)
+    public function __construct(?Browser $client = null, ?Browser $mockSearchClient = null, ?LoopInterface $loop = null)
     {
         load_config();
         $this->mockSearchClient = $mockSearchClient;
@@ -51,7 +55,12 @@ class AliceHandler
             throw new \RuntimeException('API key is not configured.');
         }
 
-        $this->client = $client ?? create_openrouter_client();
+        if ($client === null) {
+            $loop = $loop ?? Loop::get();
+            $this->client = create_openrouter_react_client($loop);
+        } else {
+            $this->client = $client;
+        }
 
         $storageBaseDir = $_ENV['STORAGE_DIR'] ?? __DIR__ . '/storage';
         $this->pendingDir = $storageBaseDir . '/pending';
@@ -92,9 +101,28 @@ class AliceHandler
 
     private function processAliceRequest(): void
     {
+        $requestStartTime = microtime(true);
+        $logFile = '/var/www/deep/.cursor/debug.log';
+        
+        // #region agent log
+        $logEntry = json_encode([
+            'sessionId' => 'debug-session',
+            'runId' => 'run1',
+            'hypothesisId' => 'TIME',
+            'location' => 'alice_handler.php:93',
+            'message' => 'Request started',
+            'data' => ['requestStartTime' => $requestStartTime],
+            'timestamp' => (int)($requestStartTime * 1000)
+        ]) . "\n";
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+        // #endregion
+        
         $inputRaw = $GLOBALS['__PHP_INPUT_MOCK__'] ?? file_get_contents('php://input');
         $input = json_decode($inputRaw, true) ?? [];
         $sessionId = $input['session']['session_id'] ?? null;
+        
+        // Сохраняем session для использования в waitForAiResponseWithTimeout
+        $GLOBALS['__ALICE_SESSION__'] = $input['session'] ?? [];
 
         if ($sessionId === null) {
             http_response_code(400);
@@ -112,10 +140,80 @@ class AliceHandler
             ]
         ];
 
+        // #region agent log
+        $logFile = '/var/www/deep/.cursor/debug.log';
+        $logEntry = json_encode([
+            'sessionId' => 'debug-session',
+            'runId' => 'run1',
+            'hypothesisId' => 'A',
+            'location' => 'alice_handler.php:115',
+            'message' => 'Checking pending state',
+            'data' => ['sessionId' => $sessionId, 'pendingDir' => $this->pendingDir],
+            'timestamp' => (int)(microtime(true) * 1000)
+        ]) . "\n";
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+        // #endregion
+        
         $pendingState = load_pending_state($sessionId, $this->pendingDir);
+        $timeAfterPendingCheck = microtime(true);
+        $elapsedToPendingCheck = $timeAfterPendingCheck - $requestStartTime;
+        
+        // #region agent log
+        $logEntry = json_encode([
+            'sessionId' => 'debug-session',
+            'runId' => 'run1',
+            'hypothesisId' => 'A',
+            'location' => 'alice_handler.php:116',
+            'message' => 'Pending state loaded',
+            'data' => [
+                'pendingState' => $pendingState, 
+                'isNull' => $pendingState === null,
+                'status' => $pendingState['status'] ?? 'none',
+                'elapsedToPendingCheck' => $elapsedToPendingCheck,
+                'hasResponse' => isset($pendingState['response'])
+            ],
+            'timestamp' => (int)($timeAfterPendingCheck * 1000)
+        ]) . "\n";
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+        // #endregion
+        
         if ($pendingState !== null) {
             $pendingResponse = $this->handlePendingState($sessionId, $pendingState, $responseTemplate);
+            
+            // #region agent log
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'B',
+                'location' => 'alice_handler.php:117',
+                'message' => 'handlePendingState result',
+                'data' => ['pendingResponse' => $pendingResponse !== null, 'status' => $pendingState['status'] ?? 'unknown'],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
+            
             if ($pendingResponse !== null) {
+                $timeBeforeSend = microtime(true);
+                $elapsedToSend = $timeBeforeSend - $requestStartTime;
+                
+                // #region agent log
+                $logEntry = json_encode([
+                    'sessionId' => 'debug-session',
+                    'runId' => 'run1',
+                    'hypothesisId' => 'TIME',
+                    'location' => 'alice_handler.php:119',
+                    'message' => 'Sending response from pending state',
+                    'data' => [
+                        'elapsedToSend' => $elapsedToSend,
+                        'responseText' => $pendingResponse['response']['text'] ?? 'no text',
+                        'status' => $pendingState['status'] ?? 'unknown'
+                    ],
+                    'timestamp' => (int)($timeBeforeSend * 1000)
+                ]) . "\n";
+                @file_put_contents($logFile, $logEntry, FILE_APPEND);
+                // #endregion
+                
                 $this->sendResponse($pendingResponse);
                 $this->releaseSession();
                 return;
@@ -124,8 +222,36 @@ class AliceHandler
 
         $history = load_conversation($sessionId, $this->conversationDir);
         $utterance = $input['request']['original_utterance'] ?? '';
+        
+        // #region agent log
+        $logEntry = json_encode([
+            'sessionId' => 'debug-session',
+            'runId' => 'run1',
+            'hypothesisId' => 'C',
+            'location' => 'alice_handler.php:127',
+            'message' => 'User utterance received',
+            'data' => ['utterance' => $utterance, 'isEmpty' => $utterance === ''],
+            'timestamp' => (int)(microtime(true) * 1000)
+        ]) . "\n";
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+        // #endregion
+        
         if ($utterance !== '') {
             $userMessage = clean_input($utterance);
+            
+            // #region agent log
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'D',
+                'location' => 'alice_handler.php:128',
+                'message' => 'User message cleaned',
+                'data' => ['userMessage' => $userMessage, 'isGotovo' => mb_strtolower(trim($userMessage)) === 'готово'],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
+            
             $history[] = create_user_message($userMessage);
             save_conversation($sessionId, $history, $this->conversationDir);
 
@@ -144,7 +270,7 @@ class AliceHandler
             try {
                 $requestStartTime = microtime(true);
                 $responseDeadline = $requestStartTime + QUICK_RESPONSE_TIMEOUT;
-                $processDeadline = $responseDeadline;
+                $aiDeadline = $requestStartTime + MAX_WAIT_SECONDS; // Полный таймаут для AI
 
                 $saveConversationCallback = function(array $hist) use ($sessionId) {
                         save_conversation($sessionId, $hist, $this->conversationDir);
@@ -154,84 +280,80 @@ class AliceHandler
                         process_function_calls($toolCalls, $hist, $this->mockSearchClient);
                 };
 
+                // Запускаем запрос к AI с проверкой времени
                 $finalResponse = null;
+                $intermediateResponseSent = false;
                 
                 try {
-                        $finalResponse = process_ai_request_loop(
-                                $this->client,
-                                $this->model_id,
-                                $history,
+                        // Запускаем запрос к AI, но проверяем время
+                        $finalResponse = $this->waitForAiResponseWithTimeout(
                                 $requestStartTime,
-                                $processDeadline,
+                                $responseDeadline,
+                                $aiDeadline,
+                                $history,
                                 $saveConversationCallback,
-                                $processFunctionCallsCallback
+                                $processFunctionCallsCallback,
+                                $responseTemplate,
+                                $intermediateResponseSent
                         );
                 } catch (\Throwable $e) {
-                        error_log('Error in process_ai_request_loop: ' . $e->getMessage());
+                        error_log('Error in waitForAiResponseWithTimeout: ' . $e->getMessage());
+                        $finalResponse = [
+                                'text' => format_ai_error($e),
+                                'message' => create_assistant_message_from_text(format_ai_error($e))
+                        ];
                 }
 
-                $elapsed = microtime(true) - $requestStartTime;
-                
-                if ($elapsed >= QUICK_RESPONSE_TIMEOUT) {
+                // Если промежуточный ответ был отправлен - продолжаем ждать в фоне
+                if ($intermediateResponseSent) {
                         $pendingState = $this->createPendingState($sessionId, $history);
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                        $this->sendResponse($responseTemplate);
-                        $this->releaseSession();
-                        $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
-                        return;
-                }
-                
-                if ($finalResponse === null) {
-                        $pendingState = $this->createPendingState($sessionId, $history);
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                        $this->sendResponse($responseTemplate);
-                        $this->releaseSession();
-                        $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
+                        $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], $finalResponse);
                         return;
                 }
 
-                $responseTemplate['response']['text'] = $this->truncateResponse($finalResponse['text']);
-                save_conversation($sessionId, $history, $this->conversationDir);
-                $this->sendResponse($responseTemplate);
-                $this->releaseSession();
-                return;
+                // Если ответ пришел вовремя - отдаем сразу
+                if ($finalResponse !== null) {
+                        $timeBeforeFinalSend = microtime(true);
+                        $elapsedToFinalSend = $timeBeforeFinalSend - $requestStartTime;
+                        
+                        // #region agent log
+                        $logFile = '/var/www/deep/.cursor/debug.log';
+                        $logEntry = json_encode([
+                            'sessionId' => 'debug-session',
+                            'runId' => 'run1',
+                            'hypothesisId' => 'TIME',
+                            'location' => 'alice_handler.php:300',
+                            'message' => 'Sending final response immediately',
+                            'data' => [
+                                'elapsedToFinalSend' => $elapsedToFinalSend,
+                                'responseText' => $finalResponse['text'] ?? 'no text'
+                            ],
+                            'timestamp' => (int)($timeBeforeFinalSend * 1000)
+                        ]) . "\n";
+                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+                        // #endregion
+                        
+                        $responseTemplate['response']['text'] = $this->truncateResponse($finalResponse['text']);
+                        save_conversation($sessionId, $history, $this->conversationDir);
+                        $this->sendResponse($responseTemplate);
+                        $this->releaseSession();
+                        return;
+                }
             } catch (ConnectException $e) {
-                $errno = get_curl_errno($e);
-                if (is_timeout_errno($errno)) {
-                    $pendingState = $this->createPendingState($sessionId, $history);
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                    $this->sendResponse($responseTemplate);
-                    $this->releaseSession();
-                    $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
-                    return;
-                }
-
-                error_log('OpenRouter connection error: ' . $e->getMessage());
-                error_log('OpenRouter connection context: ' . json_encode($e->getHandlerContext()));
-                $errorText = format_connect_error($e);
-                $responseTemplate['response']['text'] = $errorText;
-                $history[] = create_assistant_message_from_text($errorText);
-                save_conversation($sessionId, $history, $this->conversationDir);
+                // Ошибка соединения - отправляем промежуточный ответ и продолжаем в фоне
+                $pendingState = $this->createPendingState($sessionId, $history);
+                $responseTemplate['response']['text'] = WAITING_MESSAGE;
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
+                $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], null);
                 return;
             } catch (RequestException $e) {
-                if (is_timeout_exception($e)) {
-                    $pendingState = $this->createPendingState($sessionId, $history);
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                    $this->sendResponse($responseTemplate);
-                    $this->releaseSession();
-                    $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at']);
-                    return;
-                }
-
-                error_log('OpenRouter API error: ' . $e->getMessage());
-                $errorText = format_request_error($e);
-                $responseTemplate['response']['text'] = $errorText;
-                $history[] = create_assistant_message_from_text($errorText);
-                save_conversation($sessionId, $history, $this->conversationDir);
+                // Ошибка запроса - отправляем промежуточный ответ и продолжаем в фоне
+                $pendingState = $this->createPendingState($sessionId, $history);
+                $responseTemplate['response']['text'] = WAITING_MESSAGE;
                 $this->sendResponse($responseTemplate);
                 $this->releaseSession();
+                $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], null);
                 return;
             }
         }
@@ -315,7 +437,155 @@ class AliceHandler
         return $state;
     }
 
-    private function continueBackgroundFetch(string $sessionId, array $history, float $startedAt): void
+    private function waitForAiResponseWithTimeout(
+        float $requestStartTime,
+        float $responseDeadline,
+        float $aiDeadline,
+        array &$history,
+        callable $saveConversationCallback,
+        callable $processFunctionCallsCallback,
+        array &$responseTemplate,
+        bool &$intermediateResponseSent
+    ): ?array {
+        // Создаем EventLoop для асинхронной обработки
+        $loop = Loop::get();
+        
+        // Проверяем, не истекло ли время
+        $timeoutForRequest = $responseDeadline - $requestStartTime;
+        if ($timeoutForRequest <= 0) {
+                $intermediateResponseSent = true;
+                return null;
+        }
+        
+        // Создаем Deferred для синхронизации результата
+        $resultDeferred = new \React\Promise\Deferred();
+        $finalResponse = null;
+        $responseReceived = false;
+        $timer = null;
+        
+        // Запускаем таймер на responseDeadline
+        $timer = $loop->addTimer($timeoutForRequest, function () use (
+                &$intermediateResponseSent,
+                &$responseReceived,
+                &$responseTemplate,
+                $resultDeferred,
+                $responseDeadline
+        ) {
+                if (!$responseReceived) {
+                        $intermediateResponseSent = true;
+                        
+                        // #region agent log
+                        $logFile = '/var/www/deep/.cursor/debug.log';
+                        $logEntry = json_encode([
+                            'sessionId' => 'debug-session',
+                            'runId' => 'run1',
+                            'hypothesisId' => 'TIME',
+                            'location' => 'alice_handler.php:450',
+                            'message' => 'Timeout reached, sending WAITING_MESSAGE',
+                            'data' => [
+                                'responseDeadline' => $responseDeadline
+                            ],
+                            'timestamp' => (int)(microtime(true) * 1000)
+                        ]) . "\n";
+                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+                        // #endregion
+                        
+                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
+                        $this->sendResponse($responseTemplate);
+                        $this->releaseSession();
+                        
+                        $resultDeferred->resolve(null);
+                }
+        });
+        
+        // Запускаем асинхронный запрос к AI
+        $aiPromise = process_ai_request_loop(
+                $this->client,
+                $this->model_id,
+                $history,
+                $requestStartTime,
+                $aiDeadline,
+                $saveConversationCallback,
+                $processFunctionCallsCallback,
+                $loop
+        );
+        
+        $aiPromise->then(function ($response) use (
+                &$finalResponse,
+                &$responseReceived,
+                $timer,
+                $loop,
+                $resultDeferred,
+                $requestStartTime,
+                $responseDeadline
+        ) {
+                $responseReceived = true;
+                $elapsed = microtime(true) - $requestStartTime;
+                
+                // Если ответ пришел до дедлайна - отменяем таймер и возвращаем ответ
+                if ($elapsed < $responseDeadline) {
+                        if ($timer !== null) {
+                                $loop->cancelTimer($timer);
+                        }
+                        $finalResponse = $response;
+                        $resultDeferred->resolve($response);
+                } else {
+                        // Ответ пришел после дедлайна, но мы уже отправили промежуточный ответ
+                        $finalResponse = $response;
+                        $resultDeferred->resolve(null);
+                }
+        })->otherwise(function (\Throwable $e) use (
+                &$responseReceived,
+                $timer,
+                $loop,
+                $resultDeferred,
+                $requestStartTime,
+                $responseDeadline
+        ) {
+                $responseReceived = true;
+                $elapsed = microtime(true) - $requestStartTime;
+                
+                error_log('Error in process_ai_request_loop: ' . $e->getMessage());
+                $errorResponse = [
+                        'text' => format_ai_error($e),
+                        'message' => create_assistant_message_from_text(format_ai_error($e))
+                ];
+                
+                if ($elapsed < $responseDeadline) {
+                        if ($timer !== null) {
+                                $loop->cancelTimer($timer);
+                        }
+                        $resultDeferred->resolve($errorResponse);
+                } else {
+                        $resultDeferred->resolve(null);
+                }
+        });
+        
+        // Блокируем выполнение до получения результата
+        $result = null;
+        $promiseResolved = false;
+        $promise = $resultDeferred->promise();
+        $promise->then(function ($res) use (&$result, &$promiseResolved, $loop) {
+                $result = $res;
+                $promiseResolved = true;
+                $loop->stop();
+        })->otherwise(function ($e) use (&$result, &$promiseResolved, $loop) {
+                error_log('Error in promise: ' . $e->getMessage());
+                $result = null;
+                $promiseResolved = true;
+                $loop->stop();
+        });
+        
+        // Запускаем EventLoop до получения результата
+        $endTime = microtime(true) + $timeoutForRequest + 1.0;
+        while (!$promiseResolved && microtime(true) < $endTime) {
+                $loop->run();
+        }
+        
+        return $result;
+    }
+
+    private function continueBackgroundFetch(string $sessionId, array $history, float $startedAt, ?array $partialResponse = null): void
     {
         $deadline = $startedAt + MAX_WAIT_SECONDS;
         ignore_user_abort(true);
@@ -339,17 +609,142 @@ class AliceHandler
                     process_function_calls($toolCalls, $hist, $this->mockSearchClient);
             };
 
-            $finalResponse = process_ai_request_loop(
-                    $this->client,
-                    $this->model_id,
-                    $history,
-                    $startedAt,
-                    $deadline,
-                    $saveConversationCallback,
-                    $processFunctionCallsCallback
-            );
+            // Если уже есть частичный ответ (например, ошибка) - используем его
+            if ($partialResponse !== null) {
+                    $finalResponse = $partialResponse;
+            } else {
+                    // Продолжаем ждать ответ от AI
+                    $loop = Loop::get();
+                    $aiPromise = process_ai_request_loop(
+                            $this->client,
+                            $this->model_id,
+                            $history,
+                            $startedAt,
+                            $deadline,
+                            $saveConversationCallback,
+                            $processFunctionCallsCallback,
+                            $loop
+                    );
+                    
+                    $promiseResolved = false;
+                    $aiPromise->then(function ($res) use (&$finalResponse, &$promiseResolved, $loop) {
+                            $finalResponse = $res;
+                            $promiseResolved = true;
+                            $loop->stop();
+                    })->otherwise(function ($e) use (&$finalResponse, &$promiseResolved, $loop) {
+                            error_log('Error in background fetch: ' . $e->getMessage());
+                            $finalResponse = [
+                                    'text' => format_ai_error($e),
+                                    'message' => create_assistant_message_from_text(format_ai_error($e))
+                            ];
+                            $promiseResolved = true;
+                            $loop->stop();
+                    });
+                    
+                    // Запускаем EventLoop до получения результата
+                    $endTime = microtime(true) + MAX_WAIT_SECONDS;
+                    while (!$promiseResolved && microtime(true) < $endTime) {
+                            $loop->run();
+                    }
+            }
+
+            // #region agent log
+            $logFile = '/var/www/deep/.cursor/debug.log';
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'E',
+                'location' => 'alice_handler.php:342',
+                'message' => 'Background fetch completed',
+                'data' => ['finalResponse' => $finalResponse !== null, 'hasText' => isset($finalResponse['text'])],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
 
             save_conversation($sessionId, $history, $this->conversationDir);
+            
+            // Если finalResponse null, создаем fallback ответ из последнего сообщения ассистента в истории
+            if ($finalResponse === null) {
+                $lastAssistantMessage = null;
+                for ($i = count($history) - 1; $i >= 0; $i--) {
+                    if (isset($history[$i]['role']) && $history[$i]['role'] === 'assistant') {
+                        $lastAssistantMessage = $history[$i];
+                        break;
+                    }
+                }
+                
+                // #region agent log
+                $logFile = '/var/www/deep/.cursor/debug.log';
+                $logEntry = json_encode([
+                    'sessionId' => 'debug-session',
+                    'runId' => 'run1',
+                    'hypothesisId' => 'E',
+                    'location' => 'alice_handler.php:560',
+                    'message' => 'finalResponse is null, checking history',
+                    'data' => [
+                        'historyCount' => count($history),
+                        'lastAssistantMessage' => $lastAssistantMessage !== null,
+                        'lastMessageRole' => !empty($history) ? ($history[count($history) - 1]['role'] ?? 'none') : 'empty'
+                    ],
+                    'timestamp' => (int)(microtime(true) * 1000)
+                ]) . "\n";
+                @file_put_contents($logFile, $logEntry, FILE_APPEND);
+                // #endregion
+                
+                if ($lastAssistantMessage !== null) {
+                    $text = build_display_text_from_parts($lastAssistantMessage['content'] ?? []);
+                    if ($text !== '' && $text !== TECH_ERROR_MESSAGE) {
+                        $finalResponse = [
+                            'text' => $text,
+                            'message' => $lastAssistantMessage
+                        ];
+                        
+                        // #region agent log
+                        $logEntry = json_encode([
+                            'sessionId' => 'debug-session',
+                            'runId' => 'run1',
+                            'hypothesisId' => 'E',
+                            'location' => 'alice_handler.php:580',
+                            'message' => 'Created fallback response from last assistant message',
+                            'data' => ['fallbackText' => $finalResponse['text'] ?? 'no text'],
+                            'timestamp' => (int)(microtime(true) * 1000)
+                        ]) . "\n";
+                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+                        // #endregion
+                    } else {
+                        $finalResponse = [
+                            'text' => 'Не удалось получить ответ от модели',
+                            'message' => create_assistant_message_from_text('Не удалось получить ответ от модели')
+                        ];
+                    }
+                } else {
+                    $finalResponse = [
+                        'text' => 'Не удалось получить ответ от модели',
+                        'message' => create_assistant_message_from_text('Не удалось получить ответ от модели')
+                    ];
+                }
+            }
+            
+            // #region agent log
+            $logFile = '/var/www/deep/.cursor/debug.log';
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'E',
+                'location' => 'alice_handler.php:575',
+                'message' => 'Saving pending state as ready',
+                'data' => [
+                    'sessionId' => $sessionId, 
+                    'pendingDir' => $this->pendingDir,
+                    'finalResponseNotNull' => $finalResponse !== null,
+                    'responseText' => $finalResponse['text'] ?? 'no text'
+                ],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
+            
             save_pending_state($sessionId, [
                     'status' => 'ready',
                     'started_at' => $startedAt,
@@ -357,6 +752,19 @@ class AliceHandler
                     'response' => $finalResponse,
                     'conversation_updated' => true
             ], $this->pendingDir);
+            
+            // #region agent log
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'E',
+                'location' => 'alice_handler.php:359',
+                'message' => 'Pending state saved as ready',
+                'data' => ['saved' => true],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
         } catch (ConnectException $e) {
             $errno = get_curl_errno($e);
             if (is_timeout_errno($errno)) {
@@ -420,12 +828,48 @@ class AliceHandler
 
     private function handlePendingState(string $sessionId, array $pendingState, array $responseTemplate): ?array
     {
+        $logFile = '/var/www/deep/.cursor/debug.log';
+        $now = microtime(true);
         $status = $pendingState['status'] ?? '';
         $startedAt = $pendingState['started_at'] ?? microtime(true);
         $deadline = $startedAt + MAX_WAIT_SECONDS;
-        $now = microtime(true);
+        $elapsedSinceStart = $now - $startedAt;
+        
+        // #region agent log
+        $logEntry = json_encode([
+            'sessionId' => 'debug-session',
+            'runId' => 'run1',
+            'hypothesisId' => 'B',
+            'location' => 'alice_handler.php:421',
+            'message' => 'handlePendingState entry',
+            'data' => [
+                'status' => $status, 
+                'hasResponse' => array_key_exists('response', $pendingState),
+                'startedAt' => $startedAt,
+                'now' => $now,
+                'elapsedSinceStart' => $elapsedSinceStart,
+                'deadline' => $deadline,
+                'remaining' => $deadline - $now,
+                'pendingStateKeys' => array_keys($pendingState)
+            ],
+            'timestamp' => (int)($now * 1000)
+        ]) . "\n";
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+        // #endregion
 
-        if ($status === 'ready' && array_key_exists('response', $pendingState)) {
+        if ($status === 'ready' && array_key_exists('response', $pendingState) && $pendingState['response'] !== null) {
+            // #region agent log
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'B',
+                'location' => 'alice_handler.php:428',
+                'message' => 'Status is ready, returning response',
+                'data' => ['responseText' => $pendingState['response']['text'] ?? 'no text', 'responseIsNull' => $pendingState['response'] === null],
+                'timestamp' => (int)(microtime(true) * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
             $responsePayload = $pendingState['response'];
             $conversationUpdated = (bool) ($pendingState['conversation_updated'] ?? false);
 
@@ -457,7 +901,26 @@ class AliceHandler
         }
 
         if ($status === 'pending') {
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
+            // #region agent log
+            $logEntry = json_encode([
+                'sessionId' => 'debug-session',
+                'runId' => 'run1',
+                'hypothesisId' => 'B',
+                'location' => 'alice_handler.php:459',
+                'message' => 'Status is pending, returning WAITING_MESSAGE',
+                'data' => [
+                    'elapsed' => $elapsedSinceStart, 
+                    'deadline' => $deadline,
+                    'remaining' => $deadline - $now,
+                    'MAX_WAIT_SECONDS' => MAX_WAIT_SECONDS,
+                    'fullPendingState' => $pendingState
+                ],
+                'timestamp' => (int)($now * 1000)
+            ]) . "\n";
+            @file_put_contents($logFile, $logEntry, FILE_APPEND);
+            // #endregion
+            
+            $responseTemplate['response']['text'] = WAITING_MESSAGE;
             return $responseTemplate;
         }
 
