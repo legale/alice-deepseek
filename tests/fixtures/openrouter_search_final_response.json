@@ -1,0 +1,27 @@
+{
+  "id": "gen-1234567894",
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "object": "chat.completion",
+  "created": 1703000004,
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Президент США на данный момент - Джо Байден."
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 300,
+    "completion_tokens": 20,
+    "total_tokens": 320
+  }
+}
+

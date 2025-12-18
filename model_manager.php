@@ -13,9 +13,18 @@ function load_model_list(string $path): array
 
         $models = [];
         foreach ($lines as $line) {
-                list($name, $max_tokens) = explode(" ", $line, 2);
-                $name = trim($name);
-                $max_tokens = (int)trim($max_tokens);
+                $line = trim($line);
+                if ($line === '') {
+                        continue;
+                }
+                
+                $parts = preg_split('/\s+/', $line, 2);
+                if (count($parts) < 2) {
+                        continue;
+                }
+                
+                $name = trim($parts[0]);
+                $max_tokens = (int)trim($parts[1]);
                 if ($name !== '') {
                         $models[$name] = [$name, $max_tokens];
                 }

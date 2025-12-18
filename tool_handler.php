@@ -30,7 +30,7 @@ function build_tools_definition(): array
         ];
 }
 
-function perform_google_search(string $query): array
+function perform_google_search(string $query, ?Client $mockClient = null): array
 {
         $apiKey = $_ENV['GOOGLE_API_KEY'] ?? '';
         $cx = $_ENV['GOOGLE_CX'] ?? '';
@@ -52,10 +52,14 @@ function perform_google_search(string $query): array
                         'num' => 5
                 ];
 
-                $searchClient = new Client([
-                        'timeout' => SEARCH_TIMEOUT,
-                        'connect_timeout' => SEARCH_CONNECT_TIMEOUT
-                ]);
+                if ($mockClient !== null) {
+                        $searchClient = $mockClient;
+                } else {
+                        $searchClient = new Client([
+                                'timeout' => SEARCH_TIMEOUT,
+                                'connect_timeout' => SEARCH_CONNECT_TIMEOUT
+                        ]);
+                }
 
                 $response = $searchClient->get($url, ['query' => $params]);
                 $body = json_decode($response->getBody(), true);
@@ -125,7 +129,7 @@ function perform_google_search(string $query): array
         }
 }
 
-function process_function_calls(array $toolCalls, array &$history): void
+function process_function_calls(array $toolCalls, array &$history, ?Client $mockSearchClient = null): void
 {
         foreach ($toolCalls as $toolCall) {
                 if (!is_array($toolCall)) {
@@ -147,7 +151,7 @@ function process_function_calls(array $toolCalls, array &$history): void
                         } else {
                                 $query = trim($arguments['query']);
                                 error_log('Executing Google search for query: ' . $query);
-                                $result = perform_google_search($query);
+                                $result = perform_google_search($query, $mockSearchClient);
                         }
 
                         $history[] = [

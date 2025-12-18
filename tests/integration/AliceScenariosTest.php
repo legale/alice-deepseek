@@ -64,11 +64,38 @@ class AliceScenariosTest extends TestCase
                 unset($GLOBALS['__PHP_INPUT_MOCK__']);
         }
 
+        private function loadFixture(string $filename): array
+        {
+                $path = dirname(__DIR__) . '/fixtures/' . $filename;
+                if (!file_exists($path)) {
+                        throw new \RuntimeException("Fixture file not found: {$filename} at {$path}");
+                }
+                $content = file_get_contents($path);
+                $data = json_decode($content, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                        throw new \RuntimeException("Invalid JSON in fixture: {$filename}");
+                }
+                return $data;
+        }
+
+        private function setupMockGoogleSearchClient(): Client
+        {
+                $googleResponse = $this->loadFixture('google_search_response.json');
+                $mockHandler = new MockHandler([
+                        new Response(200, ['Content-Type' => 'application/json'], json_encode($googleResponse))
+                ]);
+                $handlerStack = HandlerStack::create($mockHandler);
+                return new Client(['handler' => $handlerStack]);
+        }
+
         private function setupMockClient(array $responses, ?int $delayMicroseconds = null): void
         {
                 $mockResponses = [];
-                foreach ($responses as $responseJson) {
-                        $mockResponses[] = new Response(200, ['Content-Type' => 'application/json'], json_encode($responseJson));
+                foreach ($responses as $response) {
+                        if (is_string($response)) {
+                                $response = $this->loadFixture($response);
+                        }
+                        $mockResponses[] = new Response(200, ['Content-Type' => 'application/json'], json_encode($response));
                 }
 
                 $mockHandler = new MockHandler($mockResponses);
@@ -136,18 +163,7 @@ class AliceScenariosTest extends TestCase
 
         public function test_scenario_1_initial_request(): void
         {
-                $apiResponse = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Привет! Я готов помочь.']]
-                                        ]
-                                ]
-                        ]
-                ];
-
-                $this->setupMockClient([$apiResponse]);
+                $this->setupMockClient(['openrouter_initial_response.json']);
 
                 $input = [
                         'session' => [
@@ -176,28 +192,6 @@ class AliceScenariosTest extends TestCase
 
         public function test_scenario_2_initial_then_say_hello(): void
         {
-                $apiResponse1 = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Привет!']]
-                                        ]
-                                ]
-                        ]
-                ];
-
-                $apiResponse2 = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Hello!']]
-                                        ]
-                                ]
-                        ]
-                ];
-
                 $input1 = [
                         'session' => [
                                 'session_id' => 'test_session_2',
@@ -211,7 +205,7 @@ class AliceScenariosTest extends TestCase
                 ];
 
                 $this->mockPhpInput($input1);
-                $this->setupMockClient([$apiResponse1]);
+                $this->setupMockClient(['openrouter_initial_response.json']);
 
                 $output1 = $this->captureOutput(function () {
                         $handler = new AliceHandler($this->mockClient);
@@ -237,7 +231,7 @@ class AliceScenariosTest extends TestCase
                 ];
 
                 $this->mockPhpInput($input2);
-                $this->setupMockClient([$apiResponse2]);
+                $this->setupMockClient(['openrouter_say_hello_response.json']);
 
                 $output2 = '';
                 try {
@@ -264,18 +258,7 @@ class AliceScenariosTest extends TestCase
 
         public function test_scenario_3_slow_request_timeout(): void
         {
-                $apiResponse = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Это очень длинный ответ, который требует много времени для генерации...']]
-                                        ]
-                                ]
-                        ]
-                ];
-
-                $this->setupMockClient([$apiResponse], 5000000);
+                $this->setupMockClient(['openrouter_slow_response.json'], 5000000);
 
                 $input = [
                         'session' => [
@@ -304,39 +287,7 @@ class AliceScenariosTest extends TestCase
 
         public function test_scenario_4_internet_search(): void
         {
-                $apiResponse1 = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Ищу информацию...']],
-                                                'tool_calls' => [
-                                                        [
-                                                                'id' => 'call_1',
-                                                                'type' => 'function',
-                                                                'function' => [
-                                                                        'name' => 'search_internet',
-                                                                        'arguments' => json_encode(['query' => 'US president 2024'])
-                                                                ]
-                                                        ]
-                                                ]
-                                        ]
-                                ]
-                        ]
-                ];
-
-                $apiResponse2 = [
-                        'choices' => [
-                                [
-                                        'message' => [
-                                                'role' => 'assistant',
-                                                'content' => [['type' => 'text', 'text' => 'Президент США на данный момент - Джо Байден.']]
-                                        ]
-                                ]
-                        ]
-                ];
-
-                $this->setupMockClient([$apiResponse1, $apiResponse2]);
+                $this->setupMockClient(['openrouter_search_tool_call.json', 'openrouter_search_final_response.json']);
 
                 $_ENV['GOOGLE_API_KEY'] = 'test_google_key';
                 $_ENV['GOOGLE_CX'] = 'test_cx';
@@ -354,9 +305,11 @@ class AliceScenariosTest extends TestCase
                 ];
 
                 $this->mockPhpInput($input);
+                
+                $mockGoogleClient = $this->setupMockGoogleSearchClient();
 
-                $output = $this->captureOutput(function () {
-                        $handler = new AliceHandler($this->mockClient);
+                $output = $this->captureOutput(function () use ($mockGoogleClient) {
+                        $handler = new AliceHandler($this->mockClient, $mockGoogleClient);
                         $handler->handleRequest();
                 });
 

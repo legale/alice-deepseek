@@ -18,6 +18,7 @@ class AliceHandler
     private const MAX_RESPONSE_LENGTH = 1024;
 
     private Client $client;
+    private ?Client $mockSearchClient;
     private string $model_id;
     private int $max_tokens;
     private string $apiKey;
@@ -39,9 +40,10 @@ class AliceHandler
     со мной можно вести длинный разговор на любую тему! Держу большой контекст (132к), а если GPT-OSS надоест, могу переключатся
      между моделями, не теряя нить разговора. Спроси что угодно или скажи «переключи модель», чтобы выбрать другую модель.';
 
-    public function __construct(?Client $client = null)
+    public function __construct(?Client $client = null, ?Client $mockSearchClient = null)
     {
         load_config();
+        $this->mockSearchClient = $mockSearchClient;
 
         $this->model_id = $_ENV['MODEL_ID'] ?? '';
         $this->apiKey = $_ENV['OPENROUTER_API_KEY'] ?? ($_ENV['GEMINI_API_KEY'] ?? '');
@@ -147,7 +149,7 @@ class AliceHandler
                 };
 
                 $processFunctionCallsCallback = function(array $toolCalls, array &$hist) {
-                        process_function_calls($toolCalls, $hist);
+                        process_function_calls($toolCalls, $hist, $this->mockSearchClient);
                 };
 
                 $finalResponse = null;
@@ -332,7 +334,7 @@ class AliceHandler
             };
 
             $processFunctionCallsCallback = function(array $toolCalls, array &$hist) {
-                    process_function_calls($toolCalls, $hist);
+                    process_function_calls($toolCalls, $hist, $this->mockSearchClient);
             };
 
             $finalResponse = process_ai_request_loop(

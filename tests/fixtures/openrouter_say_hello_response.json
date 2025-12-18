@@ -1,0 +1,27 @@
+{
+  "id": "gen-1234567891",
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "object": "chat.completion",
+  "created": 1703000001,
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello!"
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 5,
+    "total_tokens": 105
+  }
+}
+

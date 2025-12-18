@@ -1,0 +1,27 @@
+{
+  "id": "gen-1234567892",
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "object": "chat.completion",
+  "created": 1703000002,
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Это очень длинный ответ, который требует много времени для генерации и содержит много информации для обработки."
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 150,
+    "completion_tokens": 200,
+    "total_tokens": 350
+  }
+}
+

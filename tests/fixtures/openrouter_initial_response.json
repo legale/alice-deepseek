@@ -1,0 +1,27 @@
+{
+  "id": "gen-1234567890",
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "object": "chat.completion",
+  "created": 1703000000,
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Привет! Я готов помочь."
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 50,
+    "completion_tokens": 10,
+    "total_tokens": 60
+  }
+}
+
