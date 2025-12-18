@@ -1,4 +1,34 @@
-openai/gpt-oss-20b:free
-nvidia/nemotron-nano-9b-v2:free
-cognitivecomputations/dolphin-mistral-24b-venice-edition:free
-google/gemma-3-27b-it:free
+openai/gpt-oss-20b:free 131072
+openai/gpt-oss-120b:free 131072
+amazon/nova-2-lite-v1:free 1000000
+qwen/qwen3-4b:free 40960
+nvidia/nemotron-3-nano-30b-a3b:free 256000
+alibaba/tongyi-deepresearch-30b-a3b:free 131072
+arcee-ai/trinity-mini:free 131072
+google/gemini-2.0-flash-exp:free 1048576
+xiaomi/mimo-v2-flash:free 262144
+cognitivecomputations/dolphin-mistral-24b-venice-edition:free 32768
+nvidia/nemotron-nano-12b-v2-vl:free 128000
+kwaipilot/kat-coder-pro:free 256000
+google/gemma-3n-e4b-it:free 8192
+mistralai/devstral-2512:free 262144
+google/gemma-3-27b-it:free 131072
+mistralai/mistral-7b-instruct:free 32768
+nvidia/nemotron-nano-9b-v2:free 128000
+mistralai/mistral-small-3.1-24b-instruct:free 128000
+google/gemma-3n-e2b-it:free 8192
+qwen/qwen3-coder:free 262000
+moonshotai/kimi-k2:free 32768
+allenai/olmo-3.1-32b-think:free 65536
+allenai/olmo-3-32b-think:free 65536
+tngtech/tng-r1t-chimera:free 163840
+tngtech/deepseek-r1t-chimera:free 163840
+qwen/qwen3-235b-a22b:free 131072
+tngtech/deepseek-r1t2-chimera:free 163840
+nex-agi/deepseek-v3.1-nex-n1:free 131072
+z-ai/glm-4.5-air:free 131072
+meta-llama/llama-3.3-70b-instruct:free 131072
+meta-llama/llama-3.2-3b-instruct:free 131072
+nousresearch/hermes-3-llama-3.1-405b:free 131072
+google/gemma-3-4b-it:free 32768
+google/gemma-3-12b-it:free 32768
