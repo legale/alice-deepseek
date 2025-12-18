@@ -13,8 +13,8 @@ const WAITING_MESSAGE = 'Надо подумать. Через нескольк�
 
 function load_config(): void
 {
-        if (session_status() === PHP_SESSION_NONE) {
-                session_start();
+        if (session_status() === PHP_SESSION_NONE && !headers_sent()) {
+                @session_start();
         }
 
         $dotenv = Dotenv::createImmutable(__DIR__);

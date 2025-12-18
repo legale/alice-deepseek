@@ -53,18 +53,20 @@ class AliceHandler
 
         $this->client = $client ?? create_openrouter_client();
 
-        $this->pendingDir = __DIR__ . '/storage/pending';
+        $storageBaseDir = $_ENV['STORAGE_DIR'] ?? __DIR__ . '/storage';
+        $this->pendingDir = $storageBaseDir . '/pending';
         if (!is_dir($this->pendingDir)) {
-            mkdir($this->pendingDir, 0777, true);
+            @mkdir($this->pendingDir, 0777, true);
         }
 
-        $this->conversationDir = __DIR__ . '/storage/conversations';
+        $this->conversationDir = $storageBaseDir . '/conversations';
         if (!is_dir($this->conversationDir)) {
-            mkdir($this->conversationDir, 0777, true);
+            @mkdir($this->conversationDir, 0777, true);
         }
 
-        $this->modelStatePath = __DIR__ . '/storage/model_state.json';
-        $this->modelList = load_model_list(__DIR__ . '/models.txt');
+        $this->modelStatePath = $_ENV['MODEL_STATE_PATH'] ?? __DIR__ . '/storage/model_state.json';
+        $modelListPath = $_ENV['MODEL_LIST_PATH'] ?? __DIR__ . '/models.txt';
+        $this->modelList = load_model_list($modelListPath);
         $this->max_tokens = 0;
         sync_model_state($this->modelList, $this->model_id, $this->modelStatePath);
 
@@ -79,7 +81,7 @@ class AliceHandler
 
     public function handleRequest(): void
     {
-        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
             http_response_code(405);
             echo 'Method Not Allowed';
             return;
@@ -485,14 +487,18 @@ class AliceHandler
 
     private function sendResponse(array $responseData): void
     {
-        header('Content-Type: application/json; charset=UTF-8');
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=UTF-8');
+        }
         echo json_encode($responseData, JSON_UNESCAPED_UNICODE);
 
         if (function_exists('fastcgi_finish_request')) {
             fastcgi_finish_request();
         } else {
-            @ob_end_flush();
-            flush();
+            if (ob_get_level() > 0) {
+                @ob_end_flush();
+            }
+            @flush();
         }
     }
 

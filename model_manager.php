@@ -59,8 +59,13 @@ function persist_model_state(string $model, string $modelStatePath): void
                 return;
         }
 
+        $dir = dirname($modelStatePath);
+        if ($dir !== '.' && $dir !== '' && !is_dir($dir)) {
+                @mkdir($dir, 0777, true);
+        }
+
         $payload = json_encode(['current_model' => $model], JSON_UNESCAPED_UNICODE);
-        file_put_contents($modelStatePath, $payload, LOCK_EX);
+        @file_put_contents($modelStatePath, $payload, LOCK_EX);
 }
 
 function sync_model_state(array &$modelList, string &$modelId, string $modelStatePath): void

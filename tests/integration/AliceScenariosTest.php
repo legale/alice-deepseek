@@ -18,9 +18,9 @@ class AliceScenariosTest extends TestCase
         protected function setUp(): void
         {
                 $this->tempDir = sys_get_temp_dir() . '/alice_test_' . uniqid();
-                mkdir($this->tempDir . '/pending', 0777, true);
-                mkdir($this->tempDir . '/conversation', 0777, true);
-                mkdir($this->tempDir . '/models', 0777, true);
+                @mkdir($this->tempDir . '/pending', 0777, true);
+                @mkdir($this->tempDir . '/conversations', 0777, true);
+                @mkdir($this->tempDir . '/models', 0777, true);
 
                 $this->originalEnvKey = $_ENV['OPENROUTER_API_KEY'] ?? '';
                 $_ENV['OPENROUTER_API_KEY'] = 'test_key';
@@ -125,12 +125,12 @@ class AliceScenariosTest extends TestCase
                 try {
                         $callback();
                         $output = ob_get_contents();
-                        while (ob_get_level() > $outputLevel) {
+                        if (ob_get_level() > $outputLevel) {
                                 ob_end_clean();
                         }
                         return trim($output);
                 } catch (\Throwable $e) {
-                        while (ob_get_level() > $outputLevel) {
+                        if (ob_get_level() > $outputLevel) {
                                 ob_end_clean();
                         }
                         throw $e;
