@@ -1,13 +1,9 @@
 <?php
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ConnectException;
-use GuzzleHttp\Exception\RequestException;
+require_once __DIR__ . '/config.php';
+
 use React\Http\Browser;
 use React\EventLoop\Loop;
-
-const SEARCH_TIMEOUT = 10.0;
-const SEARCH_CONNECT_TIMEOUT = 5.0;
 
 function build_tools_definition(): array
 {
@@ -16,13 +12,13 @@ function build_tools_definition(): array
                         'type' => 'function',
                         'function' => [
                                 'name' => 'search_internet',
-                                'description' => 'Выполняет поиск в интернете через Google Custom Search. Используй эту функцию, когда нужна актуальная информация из интернета или когда пользователь явно просит найти что-то в интернете.',
+                                'description' => 'Используй эту функцию, когда пользователь явно просит найти что-то в интернете.',
                                 'parameters' => [
                                         'type' => 'object',
                                         'properties' => [
                                                 'query' => [
                                                         'type' => 'string',
-                                                        'description' => 'Поисковый запрос для Google Custom Search. Сформулируй запрос максимально точно и информативно.'
+                                                        'description' => 'google api search query. Сформулируй запрос максимально точно и информативно.'
                                                 ]
                                         ],
                                         'required' => ['query']
@@ -63,7 +59,7 @@ function perform_google_search(string $query, ?Browser $mockClient = null): arra
                         $searchClient = $mockClient;
                 } else {
                         require_once __DIR__ . '/config.php';
-                        $searchClient = create_openrouter_react_client($loop);
+                        $searchClient = create_google_search_client($loop);
                 }
 
                 $promise = $searchClient->get($urlWithParams);

@@ -8,9 +8,6 @@ require_once 'storage.php';
 require_once 'model_manager.php';
 require_once 'ai_processor.php';
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ConnectException;
-use GuzzleHttp\Exception\RequestException;
 use React\Http\Browser;
 use React\EventLoop\LoopInterface;
 use React\EventLoop\Loop;
@@ -39,6 +36,19 @@ class AliceHandler
         'помощь',
         'что ты умеешь',
         'что ты умеешь?'
+    ];
+    private const RESET_COMMANDS = [
+        'сброс',
+        'сбрось',
+        'очисти',
+        'очистить'
+    ];
+    private const CURRENT_MODEL_COMMANDS = [
+        'текущая модель',
+        'какая модель',
+        'какая модель сейчас',
+        'название модели',
+        'модель'
     ];
     private const HELP_MESSAGE = 'Я голосовой помощник по типу chatGPT. Я отвечаю на любые вопросы, 
     со мной можно вести длинный разговор на любую тему! Держу большой контекст (132к), а если GPT-OSS надоест, могу переключатся
@@ -102,27 +112,10 @@ class AliceHandler
     private function processAliceRequest(): void
     {
         $requestStartTime = microtime(true);
-        $logFile = '/var/www/deep/.cursor/debug.log';
-        
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'TIME',
-            'location' => 'alice_handler.php:93',
-            'message' => 'Request started',
-            'data' => ['requestStartTime' => $requestStartTime],
-            'timestamp' => (int)($requestStartTime * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
         
         $inputRaw = $GLOBALS['__PHP_INPUT_MOCK__'] ?? file_get_contents('php://input');
         $input = json_decode($inputRaw, true) ?? [];
         $sessionId = $input['session']['session_id'] ?? null;
-        
-        // Сохраняем session для использования в waitForAiResponseWithTimeout
-        $GLOBALS['__ALICE_SESSION__'] = $input['session'] ?? [];
 
         if ($sessionId === null) {
             http_response_code(400);
@@ -140,130 +133,66 @@ class AliceHandler
             ]
         ];
 
-        // #region agent log
-        $logFile = '/var/www/deep/.cursor/debug.log';
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'A',
-            'location' => 'alice_handler.php:115',
-            'message' => 'Checking pending state',
-            'data' => ['sessionId' => $sessionId, 'pendingDir' => $this->pendingDir],
-            'timestamp' => (int)(microtime(true) * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
-        
         $pendingState = load_pending_state($sessionId, $this->pendingDir);
-        $timeAfterPendingCheck = microtime(true);
-        $elapsedToPendingCheck = $timeAfterPendingCheck - $requestStartTime;
         
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'A',
-            'location' => 'alice_handler.php:116',
-            'message' => 'Pending state loaded',
-            'data' => [
-                'pendingState' => $pendingState, 
-                'isNull' => $pendingState === null,
-                'status' => $pendingState['status'] ?? 'none',
-                'elapsedToPendingCheck' => $elapsedToPendingCheck,
-                'hasResponse' => isset($pendingState['response'])
-            ],
-            'timestamp' => (int)($timeAfterPendingCheck * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
+        // Проверяем, есть ли новое сообщение от пользователя
+        $utterance = $input['request']['original_utterance'] ?? '';
+        $userMessage = $utterance !== '' ? clean_input($utterance) : '';
+        $isGotovo = mb_strtolower(trim($userMessage)) === 'готово';
+        $hasNewMessage = $utterance !== '' && !$isGotovo;
         
+        // Если пользователь отправил новое сообщение (не "готово"), очищаем pending state
+        if ($pendingState !== null && $hasNewMessage) {
+            clear_pending_state($sessionId, $this->pendingDir);
+            $pendingState = null; // Сбрасываем, чтобы не обрабатывать дальше
+        }
+        
+        // Обрабатываем pending state только если нет нового сообщения или это "готово"
         if ($pendingState !== null) {
-            $pendingResponse = $this->handlePendingState($sessionId, $pendingState, $responseTemplate);
-            
-            // #region agent log
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'B',
-                'location' => 'alice_handler.php:117',
-                'message' => 'handlePendingState result',
-                'data' => ['pendingResponse' => $pendingResponse !== null, 'status' => $pendingState['status'] ?? 'unknown'],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
+            $pendingResponse = $this->handlePendingState($sessionId, $pendingState, $responseTemplate, $isGotovo);
             
             if ($pendingResponse !== null) {
-                $timeBeforeSend = microtime(true);
-                $elapsedToSend = $timeBeforeSend - $requestStartTime;
-                
-                // #region agent log
-                $logEntry = json_encode([
-                    'sessionId' => 'debug-session',
-                    'runId' => 'run1',
-                    'hypothesisId' => 'TIME',
-                    'location' => 'alice_handler.php:119',
-                    'message' => 'Sending response from pending state',
-                    'data' => [
-                        'elapsedToSend' => $elapsedToSend,
-                        'responseText' => $pendingResponse['response']['text'] ?? 'no text',
-                        'status' => $pendingState['status'] ?? 'unknown'
-                    ],
-                    'timestamp' => (int)($timeBeforeSend * 1000)
-                ]) . "\n";
-                @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                // #endregion
-                
-                $this->sendResponse($pendingResponse);
-                $this->releaseSession();
+                $this->sendResponseAndExit($pendingResponse);
                 return;
             }
         }
+        
+        // Если это "готово", но нет pending state - возвращаем сообщение и выходим
+        if ($isGotovo) {
+            $responseTemplate['response']['text'] = 'Нет ожидающих ответов. Задайте вопрос.';
+            $this->sendResponseAndExit($responseTemplate);
+            return;
+        }
 
         $history = load_conversation($sessionId, $this->conversationDir);
-        $utterance = $input['request']['original_utterance'] ?? '';
-        
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'C',
-            'location' => 'alice_handler.php:127',
-            'message' => 'User utterance received',
-            'data' => ['utterance' => $utterance, 'isEmpty' => $utterance === ''],
-            'timestamp' => (int)(microtime(true) * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
         
         if ($utterance !== '') {
-            $userMessage = clean_input($utterance);
-            
-            // #region agent log
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'D',
-                'location' => 'alice_handler.php:128',
-                'message' => 'User message cleaned',
-                'data' => ['userMessage' => $userMessage, 'isGotovo' => mb_strtolower(trim($userMessage)) === 'готово'],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
+            // Если это "готово", не добавляем в историю и не передаем в LLM
+            if ($isGotovo) {
+                // Уже обработано выше в блоке pending state
+                return;
+            }
             
             $history[] = create_user_message($userMessage);
             save_conversation($sessionId, $history, $this->conversationDir);
 
+            if ($this->processResetCommand($userMessage, $sessionId, $responseTemplate)) {
+                $this->sendResponseAndExit($responseTemplate);
+                return;
+            }
+
             if ($this->processHelpCommand($userMessage, $history, $sessionId, $responseTemplate)) {
-                $this->sendResponse($responseTemplate);
-                $this->releaseSession();
+                $this->sendResponseAndExit($responseTemplate);
                 return;
             }
 
             if ($this->processModelSwitchCommand($userMessage, $history, $sessionId, $responseTemplate)) {
-                $this->sendResponse($responseTemplate);
-                $this->releaseSession();
+                $this->sendResponseAndExit($responseTemplate);
+                return;
+            }
+
+            if ($this->processCurrentModelCommand($userMessage, $responseTemplate)) {
+                $this->sendResponseAndExit($responseTemplate);
                 return;
             }
 
@@ -294,7 +223,8 @@ class AliceHandler
                                 $saveConversationCallback,
                                 $processFunctionCallsCallback,
                                 $responseTemplate,
-                                $intermediateResponseSent
+                                $intermediateResponseSent,
+                                $sessionId
                         );
                 } catch (\Throwable $e) {
                         error_log('Error in waitForAiResponseWithTimeout: ' . $e->getMessage());
@@ -306,61 +236,44 @@ class AliceHandler
 
                 // Если промежуточный ответ был отправлен - продолжаем ждать в фоне
                 if ($intermediateResponseSent) {
-                        $pendingState = $this->createPendingState($sessionId, $history);
-                        $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], $finalResponse);
+                        // Pending state уже создан в waitForAiResponseWithTimeout
+                        $pendingState = load_pending_state($sessionId, $this->pendingDir);
+                        $startedAt = $pendingState !== null && isset($pendingState['started_at']) ? $pendingState['started_at'] : microtime(true);
+                        $this->continueBackgroundFetch($sessionId, $history, $startedAt, $finalResponse);
                         return;
                 }
 
                 // Если ответ пришел вовремя - отдаем сразу
                 if ($finalResponse !== null) {
-                        $timeBeforeFinalSend = microtime(true);
-                        $elapsedToFinalSend = $timeBeforeFinalSend - $requestStartTime;
-                        
-                        // #region agent log
-                        $logFile = '/var/www/deep/.cursor/debug.log';
-                        $logEntry = json_encode([
-                            'sessionId' => 'debug-session',
-                            'runId' => 'run1',
-                            'hypothesisId' => 'TIME',
-                            'location' => 'alice_handler.php:300',
-                            'message' => 'Sending final response immediately',
-                            'data' => [
-                                'elapsedToFinalSend' => $elapsedToFinalSend,
-                                'responseText' => $finalResponse['text'] ?? 'no text'
-                            ],
-                            'timestamp' => (int)($timeBeforeFinalSend * 1000)
-                        ]) . "\n";
-                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                        // #endregion
-                        
                         $responseTemplate['response']['text'] = $this->truncateResponse($finalResponse['text']);
                         save_conversation($sessionId, $history, $this->conversationDir);
-                        $this->sendResponse($responseTemplate);
-                        $this->releaseSession();
+                        $this->sendResponseAndExit($responseTemplate);
                         return;
                 }
-            } catch (ConnectException $e) {
-                // Ошибка соединения - отправляем промежуточный ответ и продолжаем в фоне
-                $pendingState = $this->createPendingState($sessionId, $history);
-                $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                $this->sendResponse($responseTemplate);
-                $this->releaseSession();
-                $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], null);
-                return;
-            } catch (RequestException $e) {
-                // Ошибка запроса - отправляем промежуточный ответ и продолжаем в фоне
-                $pendingState = $this->createPendingState($sessionId, $history);
-                $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                $this->sendResponse($responseTemplate);
-                $this->releaseSession();
-                $this->continueBackgroundFetch($sessionId, $history, $pendingState['started_at'], null);
+            } catch (\Throwable $e) {
+                error_log('Unexpected error: ' . $e->getMessage());
+                $errorMessage = TECH_ERROR_MESSAGE . ' (обработка запроса)';
+                $responseTemplate['response']['text'] = $errorMessage;
+                $history[] = create_assistant_message_from_text($errorMessage);
+                save_conversation($sessionId, $history, $this->conversationDir);
+                $this->sendResponseAndExit($responseTemplate);
                 return;
             }
         }
 
         $responseTemplate['response']['text'] = $this->buildGreetingMessage();
-        $this->sendResponse($responseTemplate);
-        $this->releaseSession();
+        $this->sendResponseAndExit($responseTemplate);
+    }
+
+    private function processResetCommand(string $userMessage, string $sessionId, array &$responseTemplate): bool
+    {
+        if (!$this->isResetCommand($userMessage)) {
+            return false;
+        }
+        clear_conversation($sessionId, $this->conversationDir);
+        clear_pending_state($sessionId, $this->pendingDir);
+        $responseTemplate['response']['text'] = 'Контекст сброшен';
+        return true;
     }
 
     private function processHelpCommand(string $userMessage, array &$history, string $sessionId, array &$responseTemplate): bool
@@ -390,6 +303,22 @@ class AliceHandler
         return true;
     }
 
+    private function processCurrentModelCommand(string $userMessage, array &$responseTemplate): bool
+    {
+        if (!$this->isCurrentModelCommand($userMessage)) {
+            return false;
+        }
+        $displayName = display_model_name($this->model_id);
+        $responseTemplate['response']['text'] = 'Текущая модель: ' . $displayName;
+        return true;
+    }
+
+    private function isResetCommand(string $text): bool
+    {
+        $normalized = $this->normalizeCommand($text);
+        return in_array($normalized, self::RESET_COMMANDS, true);
+    }
+
     private function isHelpCommand(string $text): bool
     {
         $normalized = $this->normalizeCommand($text);
@@ -408,6 +337,17 @@ class AliceHandler
         return false;
     }
 
+    private function isCurrentModelCommand(string $text): bool
+    {
+        $normalized = $this->normalizeCommand($text);
+        $haystack = mb_strtolower($text);
+        foreach (self::CURRENT_MODEL_COMMANDS as $command) {
+            if (mb_strpos($haystack, $command) !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private function buildGreetingMessage(): string
     {
@@ -415,15 +355,10 @@ class AliceHandler
         return sprintf('Говорит %s! Спроси что угодно или скажи «помощь», чтобы услышать инструкцию.', $displayName);
     }
 
-
     private function normalizeCommand(string $text): string
     {
-        $normalized = mb_strtolower(trim($text));
-        $normalized = rtrim($normalized, "?!.," . "\t\n\r\0\x0B");
-        return trim($normalized);
+        return trim(rtrim(mb_strtolower(trim($text)), "?!.,\t\n\r\0\x0B"));
     }
-
-
 
     private function createPendingState(string $sessionId, array $history): array
     {
@@ -445,7 +380,8 @@ class AliceHandler
         callable $saveConversationCallback,
         callable $processFunctionCallsCallback,
         array &$responseTemplate,
-        bool &$intermediateResponseSent
+        bool &$intermediateResponseSent,
+        string $sessionId
     ): ?array {
         // Создаем EventLoop для асинхронной обработки
         $loop = Loop::get();
@@ -463,36 +399,28 @@ class AliceHandler
         $responseReceived = false;
         $timer = null;
         
+        // Создаем pending state ДО отправки промежуточного ответа, чтобы знать started_at
+        $pendingState = $this->createPendingState($sessionId, $history);
+        $pendingStartedAt = $pendingState['started_at'];
+        
         // Запускаем таймер на responseDeadline
         $timer = $loop->addTimer($timeoutForRequest, function () use (
                 &$intermediateResponseSent,
                 &$responseReceived,
                 &$responseTemplate,
                 $resultDeferred,
-                $responseDeadline
+                $responseDeadline,
+                $pendingStartedAt
         ) {
                 if (!$responseReceived) {
                         $intermediateResponseSent = true;
                         
-                        // #region agent log
-                        $logFile = '/var/www/deep/.cursor/debug.log';
-                        $logEntry = json_encode([
-                            'sessionId' => 'debug-session',
-                            'runId' => 'run1',
-                            'hypothesisId' => 'TIME',
-                            'location' => 'alice_handler.php:450',
-                            'message' => 'Timeout reached, sending WAITING_MESSAGE',
-                            'data' => [
-                                'responseDeadline' => $responseDeadline
-                            ],
-                            'timestamp' => (int)(microtime(true) * 1000)
-                        ]) . "\n";
-                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                        // #endregion
-                        
-                        $responseTemplate['response']['text'] = WAITING_MESSAGE;
-                        $this->sendResponse($responseTemplate);
-                        $this->releaseSession();
+                        // Вычисляем прошедшее время с момента создания pending state
+                        $now = microtime(true);
+                        $elapsedSeconds = (int)($now - $pendingStartedAt);
+                        $waitingMessage = sprintf(WAITING_MESSAGE_FORMAT, $elapsedSeconds);
+                        $responseTemplate['response']['text'] = $waitingMessage;
+                        $this->sendResponseAndExit($responseTemplate);
                         
                         $resultDeferred->resolve(null);
                 }
@@ -648,20 +576,6 @@ class AliceHandler
                     }
             }
 
-            // #region agent log
-            $logFile = '/var/www/deep/.cursor/debug.log';
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'E',
-                'location' => 'alice_handler.php:342',
-                'message' => 'Background fetch completed',
-                'data' => ['finalResponse' => $finalResponse !== null, 'hasText' => isset($finalResponse['text'])],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
-
             save_conversation($sessionId, $history, $this->conversationDir);
             
             // Если finalResponse null, создаем fallback ответ из последнего сообщения ассистента в истории
@@ -674,44 +588,13 @@ class AliceHandler
                     }
                 }
                 
-                // #region agent log
-                $logFile = '/var/www/deep/.cursor/debug.log';
-                $logEntry = json_encode([
-                    'sessionId' => 'debug-session',
-                    'runId' => 'run1',
-                    'hypothesisId' => 'E',
-                    'location' => 'alice_handler.php:560',
-                    'message' => 'finalResponse is null, checking history',
-                    'data' => [
-                        'historyCount' => count($history),
-                        'lastAssistantMessage' => $lastAssistantMessage !== null,
-                        'lastMessageRole' => !empty($history) ? ($history[count($history) - 1]['role'] ?? 'none') : 'empty'
-                    ],
-                    'timestamp' => (int)(microtime(true) * 1000)
-                ]) . "\n";
-                @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                // #endregion
-                
                 if ($lastAssistantMessage !== null) {
                     $text = build_display_text_from_parts($lastAssistantMessage['content'] ?? []);
-                    if ($text !== '' && $text !== TECH_ERROR_MESSAGE) {
+                    if ($text !== '' && strpos($text, TECH_ERROR_MESSAGE) === false) {
                         $finalResponse = [
                             'text' => $text,
                             'message' => $lastAssistantMessage
                         ];
-                        
-                        // #region agent log
-                        $logEntry = json_encode([
-                            'sessionId' => 'debug-session',
-                            'runId' => 'run1',
-                            'hypothesisId' => 'E',
-                            'location' => 'alice_handler.php:580',
-                            'message' => 'Created fallback response from last assistant message',
-                            'data' => ['fallbackText' => $finalResponse['text'] ?? 'no text'],
-                            'timestamp' => (int)(microtime(true) * 1000)
-                        ]) . "\n";
-                        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                        // #endregion
                     } else {
                         $finalResponse = [
                             'text' => 'Не удалось получить ответ от модели',
@@ -726,89 +609,11 @@ class AliceHandler
                 }
             }
             
-            // #region agent log
-            $logFile = '/var/www/deep/.cursor/debug.log';
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'E',
-                'location' => 'alice_handler.php:575',
-                'message' => 'Saving pending state as ready',
-                'data' => [
-                    'sessionId' => $sessionId, 
-                    'pendingDir' => $this->pendingDir,
-                    'finalResponseNotNull' => $finalResponse !== null,
-                    'responseText' => $finalResponse['text'] ?? 'no text'
-                ],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
-            
             save_pending_state($sessionId, [
                     'status' => 'ready',
                     'started_at' => $startedAt,
                     'history' => $history,
                     'response' => $finalResponse,
-                    'conversation_updated' => true
-            ], $this->pendingDir);
-            
-            // #region agent log
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'E',
-                'location' => 'alice_handler.php:359',
-                'message' => 'Pending state saved as ready',
-                'data' => ['saved' => true],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
-        } catch (ConnectException $e) {
-            $errno = get_curl_errno($e);
-            if (is_timeout_errno($errno)) {
-                    save_pending_state($sessionId, [
-                            'status' => 'expired',
-                            'started_at' => $startedAt,
-                            'history' => $history
-                    ], $this->pendingDir);
-                    error_log('OpenRouter timeout for session ' . $sessionId);
-                    return;
-            }
-
-            error_log('OpenRouter connection error (background): ' . $e->getMessage());
-            error_log('OpenRouter connection context (background): ' . json_encode($e->getHandlerContext()));
-            $errorText = format_connect_error($e);
-            $payload = create_assistant_payload_from_text($errorText);
-            $this->appendAssistantMessage($sessionId, $payload['message']);
-            save_pending_state($sessionId, [
-                    'status' => 'ready',
-                    'started_at' => $startedAt,
-                    'history' => $history,
-                    'response' => $payload,
-                    'conversation_updated' => true
-            ], $this->pendingDir);
-        } catch (RequestException $e) {
-            if (is_timeout_exception($e)) {
-                    save_pending_state($sessionId, [
-                            'status' => 'expired',
-                            'started_at' => $startedAt,
-                            'history' => $history
-                    ], $this->pendingDir);
-                    error_log('OpenRouter timeout for session ' . $sessionId);
-                    return;
-            }
-
-            error_log('OpenRouter API error (background): ' . $e->getMessage());
-            $errorText = format_request_error($e);
-            $payload = create_assistant_payload_from_text($errorText);
-            $this->appendAssistantMessage($sessionId, $payload['message']);
-            save_pending_state($sessionId, [
-                    'status' => 'ready',
-                    'started_at' => $startedAt,
-                    'history' => $history,
-                    'response' => $payload,
                     'conversation_updated' => true
             ], $this->pendingDir);
         } catch (\Throwable $e) {
@@ -826,56 +631,20 @@ class AliceHandler
         }
     }
 
-    private function handlePendingState(string $sessionId, array $pendingState, array $responseTemplate): ?array
+    private function handlePendingState(string $sessionId, array $pendingState, array $responseTemplate, bool $isGotovo = false): ?array
     {
-        $logFile = '/var/www/deep/.cursor/debug.log';
         $now = microtime(true);
         $status = $pendingState['status'] ?? '';
         $startedAt = $pendingState['started_at'] ?? microtime(true);
         $deadline = $startedAt + MAX_WAIT_SECONDS;
-        $elapsedSinceStart = $now - $startedAt;
-        
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'B',
-            'location' => 'alice_handler.php:421',
-            'message' => 'handlePendingState entry',
-            'data' => [
-                'status' => $status, 
-                'hasResponse' => array_key_exists('response', $pendingState),
-                'startedAt' => $startedAt,
-                'now' => $now,
-                'elapsedSinceStart' => $elapsedSinceStart,
-                'deadline' => $deadline,
-                'remaining' => $deadline - $now,
-                'pendingStateKeys' => array_keys($pendingState)
-            ],
-            'timestamp' => (int)($now * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
 
         if ($status === 'ready' && array_key_exists('response', $pendingState) && $pendingState['response'] !== null) {
-            // #region agent log
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'B',
-                'location' => 'alice_handler.php:428',
-                'message' => 'Status is ready, returning response',
-                'data' => ['responseText' => $pendingState['response']['text'] ?? 'no text', 'responseIsNull' => $pendingState['response'] === null],
-                'timestamp' => (int)(microtime(true) * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
             $responsePayload = $pendingState['response'];
             $conversationUpdated = (bool) ($pendingState['conversation_updated'] ?? false);
 
             if (is_array($responsePayload)) {
-                $text = $responsePayload['text'] ?? TECH_ERROR_MESSAGE;
-                $responseTemplate['response']['text'] = $this->truncateResponse($text);
+                    $text = $responsePayload['text'] ?? (TECH_ERROR_MESSAGE . ' (нет ответа)');
+                    $responseTemplate['response']['text'] = $this->truncateResponse($text);
 
                 if (!$conversationUpdated && !empty($responsePayload['message'])) {
                     $this->appendAssistantMessage($sessionId, $responsePayload['message']);
@@ -901,26 +670,16 @@ class AliceHandler
         }
 
         if ($status === 'pending') {
-            // #region agent log
-            $logEntry = json_encode([
-                'sessionId' => 'debug-session',
-                'runId' => 'run1',
-                'hypothesisId' => 'B',
-                'location' => 'alice_handler.php:459',
-                'message' => 'Status is pending, returning WAITING_MESSAGE',
-                'data' => [
-                    'elapsed' => $elapsedSinceStart, 
-                    'deadline' => $deadline,
-                    'remaining' => $deadline - $now,
-                    'MAX_WAIT_SECONDS' => MAX_WAIT_SECONDS,
-                    'fullPendingState' => $pendingState
-                ],
-                'timestamp' => (int)($now * 1000)
-            ]) . "\n";
-            @file_put_contents($logFile, $logEntry, FILE_APPEND);
-            // #endregion
+            // Если это "готово", возвращаем сообщение что ответ еще формируется
+            if ($isGotovo) {
+                $responseTemplate['response']['text'] = 'Ответ еще формируется. Подождите немного.';
+                return $responseTemplate;
+            }
             
-            $responseTemplate['response']['text'] = WAITING_MESSAGE;
+            // Вычисляем прошедшее время с начала запроса
+            $elapsedSeconds = (int)($now - $startedAt);
+            $waitingMessage = sprintf(WAITING_MESSAGE_FORMAT, $elapsedSeconds);
+            $responseTemplate['response']['text'] = $waitingMessage;
             return $responseTemplate;
         }
 
@@ -970,6 +729,12 @@ class AliceHandler
         if (session_status() === PHP_SESSION_ACTIVE) {
             session_write_close();
         }
+    }
+
+    private function sendResponseAndExit(array $responseData): void
+    {
+        $this->sendResponse($responseData);
+        $this->releaseSession();
     }
 }
 

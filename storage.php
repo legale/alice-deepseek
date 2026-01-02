@@ -99,19 +99,6 @@ function get_session_file_path(string $directory, string $sessionId, bool $creat
 
         if ($create) {
                 $path = build_timestamped_file_path($directory, $sessionId);
-                // #region agent log
-                $logFile = '/var/www/deep/.cursor/debug.log';
-                $logEntry = json_encode([
-                    'sessionId' => 'debug-session',
-                    'runId' => 'run1',
-                    'hypothesisId' => 'A',
-                    'location' => 'storage.php:100',
-                    'message' => 'Created new file path',
-                    'data' => ['path' => $path, 'directory' => $directory, 'sessionId' => $sessionId, 'safeId' => $safeId],
-                    'timestamp' => (int)(microtime(true) * 1000)
-                ]) . "\n";
-                @file_put_contents($logFile, $logEntry, FILE_APPEND);
-                // #endregion
                 return $path;
         }
         
@@ -211,7 +198,6 @@ function get_conversation_file_path(string $sessionId, string $conversationDir, 
 
 function load_pending_state(string $sessionId, string $pendingDir): ?array
 {
-        $logFile = '/var/www/deep/.cursor/debug.log';
         $path = get_pending_file_path($sessionId, $pendingDir);
         
         // Если файл не найден через glob, попробуем найти напрямую по паттерну
@@ -231,51 +217,11 @@ function load_pending_state(string $sessionId, string $pendingDir): ?array
                 }
         }
         
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'A',
-            'location' => 'storage.php:194',
-            'message' => 'load_pending_state called',
-            'data' => [
-                'sessionId' => $sessionId, 
-                'pendingDir' => $pendingDir, 
-                'path' => $path, 
-                'fileExists' => $path !== null && is_file($path),
-                'dirExists' => is_dir($pendingDir),
-                'dirWritable' => is_writable($pendingDir)
-            ],
-            'timestamp' => (int)(microtime(true) * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
-        
         if ($path === null || !is_file($path)) {
                 return null;
         }
 
         $data = read_compressed_json($path);
-        
-        // #region agent log
-        $logEntry = json_encode([
-            'sessionId' => 'debug-session',
-            'runId' => 'run1',
-            'hypothesisId' => 'A',
-            'location' => 'storage.php:201',
-            'message' => 'Pending state loaded from file',
-            'data' => [
-                'isArray' => is_array($data),
-                'status' => $data['status'] ?? 'none',
-                'hasResponse' => isset($data['response']),
-                'responseIsNull' => isset($data['response']) && $data['response'] === null,
-                'dataKeys' => is_array($data) ? array_keys($data) : []
-            ],
-            'timestamp' => (int)(microtime(true) * 1000)
-        ]) . "\n";
-        @file_put_contents($logFile, $logEntry, FILE_APPEND);
-        // #endregion
-        
         return is_array($data) ? $data : null;
 }
 

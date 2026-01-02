@@ -53,7 +53,7 @@ class AiProcessorTest extends \PHPUnit\Framework\TestCase
                 $response = [];
 
                 $result = extract_response_payload($response);
-                $this->assertEquals(TECH_ERROR_MESSAGE, $result['text']);
+                $this->assertEquals(TECH_ERROR_MESSAGE . ' (неверный формат ответа)', $result['text']);
                 $this->assertEquals('assistant', $result['message']['role']);
         }
 
@@ -71,7 +71,7 @@ class AiProcessorTest extends \PHPUnit\Framework\TestCase
                 ];
 
                 $result = extract_response_payload($response);
-                $this->assertEquals(TECH_ERROR_MESSAGE, $result['text']);
+                $this->assertEquals(TECH_ERROR_MESSAGE . ' (пустой контент)', $result['text']);
         }
 
         public function test_extract_response_payload_with_invalid_structure_returns_error(): void
@@ -83,7 +83,7 @@ class AiProcessorTest extends \PHPUnit\Framework\TestCase
                 ];
 
                 $result = extract_response_payload($response);
-                $this->assertEquals(TECH_ERROR_MESSAGE, $result['text']);
+                $this->assertEquals(TECH_ERROR_MESSAGE . ' (неверный формат ответа)', $result['text']);
         }
 
         public function test_log_ai_request_masks_messages(): void

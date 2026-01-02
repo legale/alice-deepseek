@@ -48,7 +48,7 @@ class MessageBuilderTest extends \PHPUnit\Framework\TestCase
                 $result = normalize_content_parts([]);
                 $this->assertCount(1, $result);
                 $this->assertEquals('text', $result[0]['type']);
-                $this->assertEquals(TECH_ERROR_MESSAGE, $result[0]['text']);
+                $this->assertEquals(TECH_ERROR_MESSAGE . ' (пустой контент)', $result[0]['text']);
         }
 
         public function test_normalize_content_parts_with_invalid_elements_skips_them(): void
@@ -216,7 +216,7 @@ class MessageBuilderTest extends \PHPUnit\Framework\TestCase
         public function test_build_display_text_from_parts_with_empty_array_returns_error_message(): void
         {
                 $result = build_display_text_from_parts([]);
-                $this->assertEquals(TECH_ERROR_MESSAGE, $result);
+                $this->assertEquals(TECH_ERROR_MESSAGE . ' (нет текста)', $result);
         }
 
         public function test_build_display_text_from_parts_with_non_text_parts_skips_them(): void

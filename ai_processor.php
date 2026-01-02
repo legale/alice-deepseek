@@ -54,21 +54,24 @@ function extract_response_payload(array $response): array
         }
 
         error_log('Unexpected OpenRouter response: ' . json_encode($response));
-        $fallback = create_assistant_message_from_text(\TECH_ERROR_MESSAGE);
+        $errorMessage = TECH_ERROR_MESSAGE . ' (неверный формат ответа)';
+        $fallback = create_assistant_message_from_text($errorMessage);
         return [
-                'text' => \TECH_ERROR_MESSAGE,
+                'text' => $errorMessage,
                 'message' => $fallback
         ];
 }
 
-function request_ai_response(Browser $client, string $modelId, array $history, float $timeoutSeconds, \React\EventLoop\LoopInterface $loop): PromiseInterface
+function request_ai_response(Browser $client, string $modelId, array $history, float $timeoutSeconds, \React\EventLoop\LoopInterface $loop, bool $withTools = true): PromiseInterface
 {
         $messages = build_messages($history);
         $payload = [
                 'model' => $modelId,
                 'messages' => $messages,
-                'tools' => build_tools_definition(),
         ];
+        if ($withTools) {
+                $payload['tools'] = build_tools_definition();
+        }
         log_ai_request($payload);
 
         $baseUri = get_openrouter_base_uri();
@@ -83,10 +86,50 @@ function request_ai_response(Browser $client, string $modelId, array $history, f
         $timeoutTimer = null;
 
         $promise->then(
-                function (ResponseInterface $response) use ($deferred, &$timeoutTimer, $loop) {
+                function (ResponseInterface $response) use ($deferred, &$timeoutTimer, $loop, $client, $modelId, $history, $timeoutSeconds, $withTools) {
                         if ($timeoutTimer !== null) {
                                 $loop->cancelTimer($timeoutTimer);
                         }
+                        
+                        // Проверяем статус код
+                        $statusCode = $response->getStatusCode();
+                        if ($statusCode < 200 || $statusCode >= 300) {
+                                $responseBody = '';
+                                $bodyLength = 0;
+                                try {
+                                        $responseBody = (string)$response->getBody();
+                                        $bodyLength = strlen($responseBody);
+                                } catch (\Throwable $e) {
+                                        $responseBody = '(unable to read body: ' . $e->getMessage() . ')';
+                                        $bodyLength = strlen($responseBody);
+                                }
+                                
+                                // Логируем в error_log для видимости в /var/log/php-error.log
+                                $statusText = $statusCode === 400 ? 'Bad Request' : ($statusCode === 429 ? 'Too Many Requests' : 'Error');
+                                error_log('Error in request_ai_response: HTTP status code ' . $statusCode . ' (' . $statusText . ')');
+                                error_log('Response body length: ' . $bodyLength);
+                                error_log('Response body: ' . ($responseBody !== '' ? $responseBody : '(EMPTY)'));
+                                
+                                // Если модель не поддерживает tools и мы пытались их использовать - повторим запрос без tools
+                                if ($statusCode === 404 && $withTools) {
+                                        $errorData = json_decode($responseBody, true);
+                                        if (is_array($errorData) && isset($errorData['error']['message']) && 
+                                            strpos($errorData['error']['message'], 'tool use') !== false) {
+                                                error_log('Model does not support tools, retrying without tools');
+                                                $retryPromise = request_ai_response($client, $modelId, $history, $timeoutSeconds, $loop, false);
+                                                $retryPromise->then(function ($result) use ($deferred) {
+                                                        $deferred->resolve($result);
+                                                })->otherwise(function ($error) use ($deferred) {
+                                                        $deferred->reject($error);
+                                                });
+                                                return;
+                                        }
+                                }
+                                
+                                $deferred->reject(new \RuntimeException('HTTP status code ' . $statusCode . ' (' . $responseBody . ')'));
+                                return;
+                        }
+                        
                         $responseBody = (string)$response->getBody();
                         $data = json_decode($responseBody, true);
                         if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
@@ -96,16 +139,54 @@ function request_ai_response(Browser $client, string $modelId, array $history, f
                         $result = extract_response_payload($data);
                         $deferred->resolve($result);
                 },
-                function (\Throwable $error) use ($deferred, &$timeoutTimer, $loop) {
+                function (\Throwable $error) use ($deferred, &$timeoutTimer, $loop, $client, $modelId, $history, $timeoutSeconds, $withTools) {
                         if ($timeoutTimer !== null) {
                                 $loop->cancelTimer($timeoutTimer);
                         }
+                        
+                        // Логируем в error_log для видимости в /var/log/php-error.log
+                        error_log('Error in request_ai_response (rejection): ' . $error->getMessage());
+                        error_log('Error class: ' . get_class($error));
+                        if ($error->getPrevious() !== null) {
+                                error_log('Previous error: ' . $error->getPrevious()->getMessage());
+                        }
+                        
+                        // Пытаемся извлечь тело ответа из ошибки, если это HTTP ошибка
+                        $responseBody = '';
+                        if (method_exists($error, 'getResponse')) {
+                                try {
+                                        $errorResponse = $error->getResponse();
+                                        if ($errorResponse !== null && method_exists($errorResponse, 'getBody')) {
+                                                $responseBody = (string)$errorResponse->getBody();
+                                                error_log('Response body from error: ' . ($responseBody !== '' ? $responseBody : '(EMPTY)'));
+                                                
+                                                // Если модель не поддерживает tools и мы пытались их использовать - повторим запрос без tools
+                                                if ($withTools && $errorResponse->getStatusCode() === 404) {
+                                                        $errorData = json_decode($responseBody, true);
+                                                        if (is_array($errorData) && isset($errorData['error']['message']) && 
+                                                            strpos($errorData['error']['message'], 'tool use') !== false) {
+                                                                error_log('Model does not support tools, retrying without tools');
+                                                                $retryPromise = request_ai_response($client, $modelId, $history, $timeoutSeconds, $loop, false);
+                                                                $retryPromise->then(function ($result) use ($deferred) {
+                                                                        $deferred->resolve($result);
+                                                                })->otherwise(function ($retryError) use ($deferred) {
+                                                                        $deferred->reject($retryError);
+                                                                });
+                                                                return;
+                                                        }
+                                                }
+                                        }
+                                } catch (\Throwable $e) {
+                                        error_log('Failed to extract response body from error: ' . $e->getMessage());
+                                }
+                        }
+                        
                         $deferred->reject($error);
                 }
         );
 
         // Устанавливаем таймаут
-        $timeoutTimer = $loop->addTimer($timeoutSeconds, function () use ($deferred, &$timeoutTimer) {
+        $timeoutTimer = $loop->addTimer($timeoutSeconds, function () use ($deferred, &$timeoutTimer, $timeoutSeconds) {
                 $timeoutTimer = null;
                 $deferred->reject(new \RuntimeException('Request timeout after ' . $timeoutSeconds . ' seconds'));
         });
@@ -221,25 +302,14 @@ function format_ai_error(\Throwable $e): string
                 return 'Не удалось получить ответ от модели: превышено время ожидания';
         }
         
+        // Проверяем на HTTP ошибки
+        if ($e instanceof \RuntimeException && strpos($e->getMessage(), 'HTTP status code') !== false) {
+                return 'Не удалось получить ответ от модели: ' . $e->getMessage();
+        }
+        
         // Проверяем на ошибки соединения
         if ($e instanceof \RuntimeException && (strpos($e->getMessage(), 'connection') !== false || strpos($e->getMessage(), 'Connection') !== false)) {
                 return 'Не удалось получить ответ от модели: ошибка соединения';
-        }
-        
-        // Для обратной совместимости с Guzzle исключениями (если они еще используются)
-        if ($e instanceof \GuzzleHttp\Exception\ConnectException) {
-                $errno = get_curl_errno($e);
-                if (is_timeout_errno($errno)) {
-                        return 'Не удалось получить ответ от модели: превышено время ожидания';
-                }
-                return format_connect_error($e);
-        }
-        
-        if ($e instanceof \GuzzleHttp\Exception\RequestException) {
-                if (is_timeout_exception($e)) {
-                        return 'Не удалось получить ответ от модели: превышено время ожидания';
-                }
-                return format_request_error($e);
         }
         
         return 'Не удалось получить ответ от модели: ' . $e->getMessage();
